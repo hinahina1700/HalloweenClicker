@@ -125,7 +125,7 @@ export default function App() {
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'pump' | 'online' | 'shop' | 'achievements'>('pump');
   const [isResetModalOpen, setIsResetModalOpen] = useState<boolean>(false);
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
 
   // Floating & Rain
   const [floatingTexts, setFloatingTexts] = useState<FloatingText[]>([]);
@@ -178,11 +178,13 @@ export default function App() {
   const [clickCount, setClickCount] = useState<number>(0);
   const [heistCount, setHeistCount] = useState<number>(0);
 
-  // --- WEBSOCKET CONNECTION ---
+  // --- WEBSOCKET CONNECTION (RESILIENT / SILENT FALLBACK) ---
   useEffect(() => {
     let reconnectTimeout: any = null;
+    let isCancelled = false;
 
     const connectWs = () => {
+      if (isCancelled) return;
       setWsStatus('connecting');
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}`;
@@ -192,6 +194,7 @@ export default function App() {
         wsRef.current = socket;
 
         socket.onopen = () => {
+          if (isCancelled) return;
           setWsStatus('connected');
           socket.send(JSON.stringify({
             type: 'join',
@@ -204,6 +207,7 @@ export default function App() {
         };
 
         socket.onmessage = (event) => {
+          if (isCancelled) return;
           try {
             const data = JSON.parse(event.data);
             if (data.type === 'player_list') {
@@ -223,28 +227,31 @@ export default function App() {
               playSound('fail');
               addLog(`🚨 警告！ ${data.thiefName} にあなたのお菓子が ${data.stolen.toLocaleString()}個 盗まれました！`, 'alert');
             }
-          } catch (e) {
-            console.error('WS parse error:', e);
-          }
+          } catch (e) {}
         };
 
         socket.onerror = () => {
+          if (isCancelled) return;
           setWsStatus('disconnected');
         };
 
         socket.onclose = () => {
+          if (isCancelled) return;
           setWsStatus('disconnected');
-          reconnectTimeout = setTimeout(connectWs, 3000);
+          // Try reconnecting quietly after 5 seconds if not connected
+          reconnectTimeout = setTimeout(connectWs, 5000);
         };
       } catch (e) {
+        if (isCancelled) return;
         setWsStatus('disconnected');
-        reconnectTimeout = setTimeout(connectWs, 3000);
+        reconnectTimeout = setTimeout(connectWs, 5000);
       }
     };
 
     connectWs();
 
     return () => {
+      isCancelled = true;
       if (wsRef.current) {
         wsRef.current.close();
       }
@@ -254,14 +261,16 @@ export default function App() {
     };
   }, [myId]);
 
-  // Sync state with server periodically
+  // Sync state with server periodically if connected
   useEffect(() => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'update',
-        candies: Math.floor(candies),
-        level: playerLevel
-      }));
+      try {
+        wsRef.current.send(JSON.stringify({
+          type: 'update',
+          candies: Math.floor(candies),
+          level: playerLevel
+        }));
+      } catch (e) {}
     }
   }, [candies, playerLevel]);
 
@@ -434,7 +443,7 @@ export default function App() {
     addLog(`🎉 プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピングとハイスト効率がアップ！`, 'success');
   };
 
-  // --- STEAL ACTIONS (ONLINE OR BOT) ---
+  // --- STEAL ACTIONS ---
   const attemptOnlineSteal = (targetId: string) => {
     setHeistCount(prev => prev + 1);
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -443,7 +452,7 @@ export default function App() {
         targetId
       }));
     } else {
-      addLog(`⚠️ サーバーとの接続が切断されています。`, 'alert');
+      addLog(`⚠️ サーバーとの接続が切断されています。オフラインBOTをお楽しみください。`, 'alert');
     }
   };
 
@@ -505,7 +514,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-purple-950 via-slate-950 to-black text-slate-100 font-sans pb-16 select-none overflow-x-hidden relative">
       
-      {/* CANDY RAIN / SPOOKY RAIN EFFECT */}
+      {/* CANDY RAIN EFFECT */}
       {rainDrops.map(drop => (
         <div 
           key={drop.id}
@@ -545,9 +554,9 @@ export default function App() {
               </h1>
               <div className="flex items-center gap-2">
                 <p className="text-xs text-purple-300">{myName} (Lv.{playerLevel})</p>
-                <span className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${wsStatus === 'connected' ? 'bg-green-950/60 text-green-300 border-green-500/30' : 'bg-amber-950/60 text-amber-300 border-amber-500/30'}`}>
-                  {wsStatus === 'connected' ? <Wifi className="w-3 h-3 text-green-400" /> : <WifiOff className="w-3 h-3 text-amber-400" />}
-                  {wsStatus === 'connected' ? 'オンライン' : '切断中・再接続中'}
+                <span className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${wsStatus === 'connected' ? 'bg-green-950/60 text-green-300 border-green-500/30' : 'bg-purple-950/60 text-purple-300 border-purple-500/30'}`}>
+                  {wsStatus === 'connected' ? <Wifi className="w-3 h-3 text-green-400" /> : <WifiOff className="w-3 h-3 text-purple-400" />}
+                  {wsStatus === 'connected' ? 'P2P接続中' : 'オフライン/BOTモード'}
                 </span>
               </div>
             </div>
@@ -712,7 +721,7 @@ export default function App() {
 
             </div>
 
-            {/* CANDY GROWTH GRAPH */}
+            {/* CANDY GROWTH GRAPH (FIXED NUMERIC SVG VIEWBOX) */}
             <div className="bg-purple-900/30 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-xl">
               <h2 className="text-base font-bold text-orange-400 flex items-center gap-2 mb-2">
                 <TrendingUp className="w-5 h-5" /> キャンディ成長の軌跡 (リアルタイムグラフ)
@@ -721,19 +730,19 @@ export default function App() {
 
               <div className="bg-black/50 p-4 rounded-2xl border border-purple-500/25 h-48 relative flex items-end">
                 {history.length > 1 ? (
-                  <svg className="w-full h-full overflow-visible">
-                    <line x1="0" y1="20%" x2="100%" y2="20%" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
-                    <line x1="0" y1="60%" x2="100%" y2="60%" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
+                  <svg className="w-full h-full overflow-visible" viewBox="0 0 300 150" preserveAspectRatio="none">
+                    <line x1="0" y1="30" x2="300" y2="30" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
+                    <line x1="0" y1="90" x2="300" y2="90" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
                     
                     {(() => {
                       const maxVal = Math.max(...history.map(h => h.candies), 100);
                       const minVal = Math.min(...history.map(h => h.candies), 0);
                       const range = maxVal - minVal || 1;
                       const points = history.map((h, idx) => {
-                        const x = (idx / (history.length - 1)) * 100;
-                        const y = 100 - ((h.candies - minVal) / range) * 80 - 10;
-                        return `${x}% ${y}%`;
-                      }).join(', ');
+                        const x = (idx / (history.length - 1)) * 300;
+                        const y = 150 - ((h.candies - minVal) / range) * 120 - 15;
+                        return `${x},${y}`;
+                      }).join(' ');
 
                       return (
                         <>
@@ -745,13 +754,13 @@ export default function App() {
                             className="transition-all duration-300"
                           />
                           {history.map((h, idx) => {
-                            const x = (idx / (history.length - 1)) * 100;
-                            const y = 100 - ((h.candies - minVal) / range) * 80 - 10;
+                            const x = (idx / (history.length - 1)) * 300;
+                            const y = 150 - ((h.candies - minVal) / range) * 120 - 15;
                             return (
                               <circle
                                 key={idx}
-                                cx={`${x}%`}
-                                cy={`${y}%`}
+                                cx={x}
+                                cy={y}
                                 r="4"
                                 fill="#fbbf24"
                                 className="transition-all duration-300"
@@ -790,8 +799,8 @@ export default function App() {
                 </div>
                 <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300 flex items-center gap-2">
                   <span>状態:</span>
-                  <span className={wsStatus === 'connected' ? 'text-green-400 font-bold' : 'text-amber-400 font-bold'}>
-                    {wsStatus === 'connected' ? '接続中' : '接続待機中'}
+                  <span className={wsStatus === 'connected' ? 'text-green-400 font-bold' : 'text-purple-400 font-bold'}>
+                    {wsStatus === 'connected' ? '接続中' : 'オフライン (BOTモード利用可能)'}
                   </span>
                 </div>
               </div>
