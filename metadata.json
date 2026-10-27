@@ -1,0 +1,6 @@
+{
+  "name": "Halloween Candy Heist Clicker",
+  "description": "A spooky Halloween clicker game where you tap pumpkins, collect and steal candies, raid friends' stashes, and upgrade your haunted empire!",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
