@@ -30,7 +30,14 @@ interface OnlinePlayer {
   avatar: string;
   candies: number;
   level: number;
-  isBot?: boolean;
+}
+
+interface BotRival {
+  id: string;
+  name: string;
+  avatar: string;
+  candies: number;
+  level: number;
 }
 
 interface FloatingText {
@@ -91,11 +98,11 @@ const DEFAULT_ACHIEVEMENTS: Achievement[] = [
   { id: 'level_five', title: '見習いナイトメア', description: 'プレイヤーレベル5に到達する', reward: 1500, unlocked: false, condition: (s) => s.level >= 5 },
 ];
 
-const PHANTOM_BOTS: OnlinePlayer[] = [
-  { id: 'bot_lilly', name: '魔女のリリー', avatar: '🧙‍♀️', candies: 650, level: 4, isBot: true },
-  { id: 'bot_jack', name: '吸血鬼ジャック', avatar: '🧛‍♂️', candies: 2800, level: 9, isBot: true },
-  { id: 'bot_grim', name: '死神グリム', avatar: '💀', candies: 12500, level: 16, isBot: true },
-  { id: 'bot_popo', name: 'おばけのポポ', avatar: '👻', candies: 180, level: 2, isBot: true },
+const OFFLINE_BOTS: BotRival[] = [
+  { id: 'bot_lilly', name: '魔女のリリー', avatar: '🧙‍♀️', candies: 650, level: 4 },
+  { id: 'bot_jack', name: '吸血鬼ジャック', avatar: '🧛‍♂️', candies: 2800, level: 9 },
+  { id: 'bot_grim', name: '死神グリム', avatar: '💀', candies: 12500, level: 16 },
+  { id: 'bot_popo', name: 'おばけのポポ', avatar: '👻', candies: 180, level: 2 },
 ];
 
 export default function App() {
@@ -128,7 +135,8 @@ export default function App() {
   // My Player Info for WebSocket
   const [myId] = useState<string>(() => getUniqueId());
   const [myName] = useState<string>(() => `お菓子泥棒_${Math.floor(Math.random() * 900 + 100)}`);
-  const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayer[]>(PHANTOM_BOTS);
+  const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayer[]>([]);
+  const [offlineBots, setOfflineBots] = useState<BotRival[]>(OFFLINE_BOTS);
   const wsRef = useRef<WebSocket | null>(null);
 
   // History for Graph
@@ -148,7 +156,7 @@ export default function App() {
   const stealthSkill = 1 + upgrades.reduce((acc, u) => acc + (u.type === 'stealth' ? 0.5 * u.level : 0), 0);
 
   const [logs, setLogs] = useState<LogEntry[]>([
-    { id: getUniqueId(), time: '今さっき', text: 'マルチプレイヤー・ハロウィンハイストへようこそ！他のプレイヤーからキャンディを盗み出せ！', type: 'info' }
+    { id: getUniqueId(), time: '今さっき', text: 'マルチプレイヤー・ハロウィンハイストへようこそ！オンラインプレイヤーやオフラインBOTからキャンディを盗み出せ！', type: 'info' }
   ]);
 
   // Achievements
@@ -170,7 +178,7 @@ export default function App() {
   const [clickCount, setClickCount] = useState<number>(0);
   const [heistCount, setHeistCount] = useState<number>(0);
 
-  // --- ROBUST WEBSOCKET CONNECTION WITH RECONNECTION & FALLBACK ---
+  // --- WEBSOCKET CONNECTION ---
   useEffect(() => {
     let reconnectTimeout: any = null;
 
@@ -200,12 +208,7 @@ export default function App() {
             const data = JSON.parse(event.data);
             if (data.type === 'player_list') {
               const others = data.players.filter((p: OnlinePlayer) => p.id !== myId);
-              // Combine real players with phantom bots if fewer than 2 real players
-              if (others.length === 0) {
-                setOnlinePlayers(PHANTOM_BOTS);
-              } else {
-                setOnlinePlayers([...others, ...PHANTOM_BOTS.slice(0, 2)]);
-              }
+              setOnlinePlayers(others);
             } else if (data.type === 'steal_result') {
               if (data.success) {
                 setCandies(c => c + data.stolen);
@@ -231,7 +234,6 @@ export default function App() {
 
         socket.onclose = () => {
           setWsStatus('disconnected');
-          // Try reconnecting after 3 seconds
           reconnectTimeout = setTimeout(connectWs, 3000);
         };
       } catch (e) {
@@ -385,7 +387,6 @@ export default function App() {
 
     playSound('pop');
 
-    // Floating text with unique ID
     const textId = getUniqueId();
     setFloatingTexts(prev => [
       ...prev.slice(-15),
@@ -395,7 +396,6 @@ export default function App() {
       setFloatingTexts(prev => prev.filter(t => t.id !== textId));
     }, 800);
 
-    // Trigger Rain Effect with guaranteed unique IDs
     const newDrops: RainDrop[] = Array.from({ length: 8 }).map((_, i) => ({
       id: getUniqueId(),
       x: Math.random() * window.innerWidth,
@@ -424,7 +424,7 @@ export default function App() {
     addLog(`✨ アップグレード購入: ${upgrade.name} (Lv.${upgrade.level + 1})`, 'success');
   };
 
-  // --- BALANCED LEVEL UP ---
+  // --- LEVEL UP ---
   const levelUpCost = Math.floor(1000 * Math.pow(2.2, playerLevel - 1));
   const handleLevelUp = () => {
     if (candies < levelUpCost) return;
@@ -434,40 +434,39 @@ export default function App() {
     addLog(`🎉 プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピングとハイスト効率がアップ！`, 'success');
   };
 
-  // --- ONLINE HEIST ACTION WITH LOCAL FALLBACK ---
+  // --- STEAL ACTIONS (ONLINE OR BOT) ---
   const attemptOnlineSteal = (targetId: string) => {
     setHeistCount(prev => prev + 1);
-
-    // Check if target is a bot or if WS is disconnected -> simulate locally
-    const target = onlinePlayers.find(p => p.id === targetId);
-    if (target && (target.isBot || wsStatus !== 'connected')) {
-      const successChance = Math.min(85, Math.max(30, 60 + (stealthSkill * 10) + (playerLevel * 3) - (target.level * 2)));
-      const isSuccess = Math.random() * 100 <= successChance;
-
-      if (isSuccess && target.candies > 10) {
-        const stolen = Math.floor(target.candies * 0.3);
-        target.candies -= stolen;
-        setCandies(c => c + stolen);
-        setTotalCandiesEarned(t => t + stolen);
-        playSound('steal');
-        addLog(`🦹‍♂️ 強奪成功！ ${target.name} から ${stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
-      } else {
-        const penalty = Math.floor(candies * 0.05);
-        setCandies(c => Math.max(0, c - penalty));
-        playSound('fail');
-        addLog(`💥 強奪失敗！ ${target.name} に見つかり、お菓子を ${penalty}個 奪い返された…！`, 'fail');
-      }
-      return;
-    }
-
-    // Otherwise send via WebSocket
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'steal_attempt',
         targetId
       }));
     } else {
-      addLog(`⚠️ サーバーとの接続が切断されています。自動再接続中…`, 'alert');
+      addLog(`⚠️ サーバーとの接続が切断されています。`, 'alert');
+    }
+  };
+
+  const attemptBotSteal = (botId: string) => {
+    setHeistCount(prev => prev + 1);
+    const bot = offlineBots.find(b => b.id === botId);
+    if (!bot) return;
+
+    const successChance = Math.min(85, Math.max(30, 60 + (stealthSkill * 10) + (playerLevel * 3) - (bot.level * 2)));
+    const isSuccess = Math.random() * 100 <= successChance;
+
+    if (isSuccess && bot.candies > 10) {
+      const stolen = Math.floor(bot.candies * 0.3);
+      setOfflineBots(prev => prev.map(b => b.id === botId ? { ...b, candies: b.candies - stolen } : b));
+      setCandies(c => c + stolen);
+      setTotalCandiesEarned(t => t + stolen);
+      playSound('steal');
+      addLog(`🦹‍♂️ BOT強奪成功！ ${bot.name} から ${stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
+    } else {
+      const penalty = Math.floor(candies * 0.05);
+      setCandies(c => Math.max(0, c - penalty));
+      playSound('fail');
+      addLog(`💥 BOT強奪失敗！ ${bot.name} に見つかり、お菓子を ${penalty}個 奪い返された…！`, 'fail');
     }
   };
 
@@ -548,7 +547,7 @@ export default function App() {
                 <p className="text-xs text-purple-300">{myName} (Lv.{playerLevel})</p>
                 <span className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${wsStatus === 'connected' ? 'bg-green-950/60 text-green-300 border-green-500/30' : 'bg-amber-950/60 text-amber-300 border-amber-500/30'}`}>
                   {wsStatus === 'connected' ? <Wifi className="w-3 h-3 text-green-400" /> : <WifiOff className="w-3 h-3 text-amber-400" />}
-                  {wsStatus === 'connected' ? 'オンライン' : '接続中/自動復旧'}
+                  {wsStatus === 'connected' ? 'オンライン' : '切断中・再接続中'}
                 </span>
               </div>
             </div>
@@ -616,7 +615,7 @@ export default function App() {
             onClick={() => setActiveTab('online')}
             className={`py-2 px-2 rounded-xl text-xs md:text-sm font-bold flex items-center justify-center gap-1 transition-all cursor-pointer ${activeTab === 'online' ? 'bg-orange-600 text-black shadow-lg shadow-orange-600/30' : 'text-purple-300 hover:bg-purple-900/50'}`}
           >
-            <span>🌐</span> <span>オンライン強奪 ({onlinePlayers.length})</span>
+            <span>🌐</span> <span>強奪 ({onlinePlayers.length + offlineBots.length})</span>
           </button>
           <button 
             onClick={() => setActiveTab('shop')}
@@ -667,7 +666,7 @@ export default function App() {
                 </div>
 
                 <div className="bg-purple-950/60 p-4 rounded-2xl border border-purple-500/20 text-xs text-purple-300 leading-relaxed">
-                  💡 カボチャをクリックすると、お菓子の雨が飛び出します！オンラインタブから他のライバルを襲ってキャンディを奪い取ろう！
+                  💡 カボチャをクリックすると、お菓子の雨が飛び出します！強奪タブからオンラインユーザーやオフラインBOTを襲ってキャンディを奪い取ろう！
                 </div>
               </div>
 
@@ -776,52 +775,109 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: ONLINE P2P */}
+        {/* TAB 2: ONLINE PLAYERS & OFFLINE BOTS (SEPARATE SECTIONS) */}
         {activeTab === 'online' && (
-          <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 mb-6">
-              <div>
-                <h2 className="text-xl font-black text-orange-400 flex items-center gap-2">
-                  <Users className="w-6 h-6" /> オンライン・プレイヤー強奪 (P2P / リアルタイム)
-                </h2>
-                <p className="text-xs text-purple-300">オンライン接続中のプレイヤーやライバルからキャンディを盗み出せ！</p>
-              </div>
-              <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300 flex items-center gap-2">
-                <span>接続状態:</span>
-                <span className={wsStatus === 'connected' ? 'text-green-400 font-bold' : 'text-amber-400 font-bold'}>
-                  {wsStatus === 'connected' ? 'P2P接続完了' : '自動フォールバック稼働中'}
-                </span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {onlinePlayers.map(player => (
-                <div key={player.id} className="bg-black/40 border border-purple-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-orange-500/50 transition-all">
-                  <div className="flex items-center gap-3">
-                    <div className="text-4xl p-2 bg-purple-950 rounded-2xl border border-purple-500/30">
-                      {player.avatar}
-                    </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h3 className="font-bold text-sm text-orange-300">{player.name}</h3>
-                        {player.isBot && <span className="text-[10px] bg-purple-900/60 text-purple-300 px-1.5 py-0.5 rounded border border-purple-500/30">ライバル</span>}
-                      </div>
-                      <p className="text-xs text-purple-300">Lv.{player.level} プレイヤー</p>
-                      <p className="text-xs font-bold text-amber-400 mt-1">
-                        所持: {player.candies.toLocaleString()} 🍬
-                      </p>
-                    </div>
-                  </div>
-
-                  <button 
-                    onClick={() => attemptOnlineSteal(player.id)}
-                    className="py-2 px-4 rounded-xl font-bold bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-black text-xs md:text-sm shadow-lg shadow-orange-600/30 transition-all cursor-pointer active:scale-95 whitespace-nowrap"
-                  >
-                    🦹‍♂️ 盗む
-                  </button>
+          <div className="space-y-8">
+            
+            {/* SECTION 1: REAL ONLINE PLAYERS */}
+            <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 mb-6">
+                <div>
+                  <h2 className="text-xl font-black text-orange-400 flex items-center gap-2">
+                    <Users className="w-6 h-6 text-green-400" /> 🌐 オンラインプレイヤー (リアルタイム)
+                  </h2>
+                  <p className="text-xs text-purple-300">同じ世界に接続している実際のプレイヤーたちです。</p>
                 </div>
-              ))}
+                <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300 flex items-center gap-2">
+                  <span>状態:</span>
+                  <span className={wsStatus === 'connected' ? 'text-green-400 font-bold' : 'text-amber-400 font-bold'}>
+                    {wsStatus === 'connected' ? '接続中' : '接続待機中'}
+                  </span>
+                </div>
+              </div>
+
+              {onlinePlayers.length === 0 ? (
+                <div className="bg-black/40 border border-purple-500/30 p-8 rounded-2xl text-center text-purple-300">
+                  <Ghost className="w-10 h-10 mx-auto mb-2 opacity-50 animate-bounce" />
+                  <p className="text-sm font-bold mb-1">現在オンラインの他のプレイヤーはいません</p>
+                  <p className="text-xs text-slate-400">別のタブやブラウザでこのアプリを開くと、ここにリアルプレイヤーが表示されます。</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {onlinePlayers.map(player => (
+                    <div key={player.id} className="bg-black/40 border border-green-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-green-500/60 transition-all">
+                      <div className="flex items-center gap-3">
+                        <div className="text-4xl p-2 bg-purple-950 rounded-2xl border border-purple-500/30">
+                          {player.avatar}
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-bold text-sm text-green-300">{player.name}</h3>
+                            <span className="text-[10px] bg-green-950 text-green-300 px-1.5 py-0.5 rounded border border-green-500/40">オンライン</span>
+                          </div>
+                          <p className="text-xs text-purple-300">Lv.{player.level} プレイヤー</p>
+                          <p className="text-xs font-bold text-amber-400 mt-1">
+                            所持: {player.candies.toLocaleString()} 🍬
+                          </p>
+                        </div>
+                      </div>
+
+                      <button 
+                        onClick={() => attemptOnlineSteal(player.id)}
+                        className="py-2 px-4 rounded-xl font-bold bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-black text-xs md:text-sm shadow-lg shadow-green-600/30 transition-all cursor-pointer active:scale-95 whitespace-nowrap"
+                      >
+                        🦹‍♂️ 盗む
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
+
+            {/* SECTION 2: OFFLINE BOTS / RIVALS */}
+            <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 mb-6">
+                <div>
+                  <h2 className="text-xl font-black text-orange-400 flex items-center gap-2">
+                    <Skull className="w-6 h-6 text-orange-400" /> 👻 オフラインBOT / ハロウィンライバル
+                  </h2>
+                  <p className="text-xs text-purple-300">いつでも対戦・強奪できる強力なオフラインキャラクターたちです。</p>
+                </div>
+                <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300">
+                  常時稼働
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {offlineBots.map(bot => (
+                  <div key={bot.id} className="bg-black/40 border border-purple-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-orange-500/50 transition-all">
+                    <div className="flex items-center gap-3">
+                      <div className="text-4xl p-2 bg-purple-950 rounded-2xl border border-purple-500/30">
+                        {bot.avatar}
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h3 className="font-bold text-sm text-orange-300">{bot.name}</h3>
+                          <span className="text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.5 rounded border border-purple-500/40">BOT</span>
+                        </div>
+                        <p className="text-xs text-purple-300">Lv.{bot.level} ライバル</p>
+                        <p className="text-xs font-bold text-amber-400 mt-1">
+                          所持: {bot.candies.toLocaleString()} 🍬
+                        </p>
+                      </div>
+                    </div>
+
+                    <button 
+                      onClick={() => attemptBotSteal(bot.id)}
+                      className="py-2 px-4 rounded-xl font-bold bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-black text-xs md:text-sm shadow-lg shadow-orange-600/30 transition-all cursor-pointer active:scale-95 whitespace-nowrap"
+                    >
+                      🦹‍♂️ 盗む
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+
           </div>
         )}
 
