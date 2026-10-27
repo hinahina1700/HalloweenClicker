@@ -8,7 +8,7 @@ import {
   Sparkles, Skull, Ghost, Flame, Shield, Award, Zap, 
   Volume2, VolumeX, RefreshCw, Trophy, ShoppingBag, 
   Users, TrendingUp, AlertCircle, CheckCircle2, CloudRain,
-  RotateCcw, Trash2, X, AlertTriangle, Wifi, WifiOff
+  RotateCcw, Trash2, X, AlertTriangle, Wifi
 } from 'lucide-react';
 
 // --- TYPES ---
@@ -30,6 +30,7 @@ interface OnlinePlayer {
   avatar: string;
   candies: number;
   level: number;
+  lastActive: number;
 }
 
 interface BotRival {
@@ -72,11 +73,6 @@ interface LogEntry {
   type: 'success' | 'fail' | 'info' | 'alert';
 }
 
-interface HistoryPoint {
-  time: string;
-  candies: number;
-}
-
 let uniqueIdCounter = 0;
 const getUniqueId = () => `id_${Date.now()}_${++uniqueIdCounter}_${Math.random().toString(36).substr(2, 5)}`;
 
@@ -105,8 +101,15 @@ const OFFLINE_BOTS: BotRival[] = [
   { id: 'bot_popo', name: 'おばけのポポ', avatar: '👻', candies: 180, level: 2 },
 ];
 
+const SPOOKY_NEWS = [
+  '🎃 速報: 巨大なカボチャから甘い魔力が溢れ出しています！',
+  '🧙‍♀️ 魔女のリリーがあなたの隠しストックを狙って夜空を飛んでいます。',
+  '👻 おばけたちが夜通しキャンディを集め続けています。',
+  '🦇 コウモリの群れが隣町のハロウィン会場からお菓子を強奪中！',
+  '🌙 ブラッドムーンの夜、スリの成功率がわずかに上昇中…？'
+];
+
 export default function App() {
-  // --- STATE ---
   const [candies, setCandies] = useState<number>(() => {
     const saved = localStorage.getItem('hw_candies');
     return saved !== null ? JSON.parse(saved) : 50;
@@ -123,26 +126,30 @@ export default function App() {
   });
 
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
-  const [activeTab, setActiveTab] = useState<'pump' | 'online' | 'shop' | 'achievements'>('pump');
   const [isResetModalOpen, setIsResetModalOpen] = useState<boolean>(false);
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
+  const [newsIndex, setNewsIndex] = useState<number>(0);
 
   // Floating & Rain
   const [floatingTexts, setFloatingTexts] = useState<FloatingText[]>([]);
   const [rainDrops, setRainDrops] = useState<RainDrop[]>([]);
   const [isPumpActive, setIsPumpActive] = useState<boolean>(false);
+  const [candyHistory, setCandyHistory] = useState<number[]>([50, 50]);
 
-  // My Player Info for WebSocket
+  // Record candy history for graph
+  useEffect(() => {
+    const historyTimer = setInterval(() => {
+      setCandyHistory(prev => [...prev.slice(-15), Math.floor(candies)]);
+    }, 2000);
+    return () => clearInterval(historyTimer);
+  }, [candies]);
+
+  // My Player Info for BroadcastChannel P2P
   const [myId] = useState<string>(() => getUniqueId());
   const [myName] = useState<string>(() => `お菓子泥棒_${Math.floor(Math.random() * 900 + 100)}`);
   const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayer[]>([]);
   const [offlineBots, setOfflineBots] = useState<BotRival[]>(OFFLINE_BOTS);
-  const wsRef = useRef<WebSocket | null>(null);
-
-  // History for Graph
-  const [history, setHistory] = useState<HistoryPoint[]>([
-    { time: '0s', candies: 50 }
-  ]);
+  
+  const channelRef = useRef<BroadcastChannel | null>(null);
 
   // Upgrades State
   const [upgrades, setUpgrades] = useState<Upgrade[]>(() => {
@@ -150,16 +157,14 @@ export default function App() {
     return saved ? JSON.parse(saved) : DEFAULT_UPGRADES;
   });
 
-  // Calculate derived values from upgrades
   const clickPower = 1 + upgrades.reduce((acc, u) => acc + (u.type === 'click' ? u.cpc * u.level : 0), 0);
   const autoCps = upgrades.reduce((acc, u) => acc + ((u.type === 'auto' || u.type === 'special') ? u.cps * u.level : 0), 0);
   const stealthSkill = 1 + upgrades.reduce((acc, u) => acc + (u.type === 'stealth' ? 0.5 * u.level : 0), 0);
 
   const [logs, setLogs] = useState<LogEntry[]>([
-    { id: getUniqueId(), time: '今さっき', text: 'マルチプレイヤー・ハロウィンハイストへようこそ！オンラインプレイヤーやオフラインBOTからキャンディを盗み出せ！', type: 'info' }
+    { id: getUniqueId(), time: '今さっき', text: 'クッキークリッカー風ハロウィンへようこそ！カボチャを叩いてお菓子を増やそう！', type: 'info' }
   ]);
 
-  // Achievements
   const [achievements, setAchievements] = useState<Achievement[]>(() => {
     const saved = localStorage.getItem('hw_achievements');
     if (saved) {
@@ -178,101 +183,105 @@ export default function App() {
   const [clickCount, setClickCount] = useState<number>(0);
   const [heistCount, setHeistCount] = useState<number>(0);
 
-  // --- WEBSOCKET CONNECTION (RESILIENT / SILENT FALLBACK) ---
+  // Rotate news ticker
   useEffect(() => {
-    let reconnectTimeout: any = null;
-    let isCancelled = false;
+    const ticker = setInterval(() => {
+      setNewsIndex(prev => (prev + 1) % SPOOKY_NEWS.length);
+    }, 6000);
+    return () => clearInterval(ticker);
+  }, []);
 
-    const connectWs = () => {
-      if (isCancelled) return;
-      setWsStatus('connecting');
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}`;
-      
-      try {
-        const socket = new WebSocket(wsUrl);
-        wsRef.current = socket;
+  // --- BROADCASTCHANNEL P2P SYNC ---
+  useEffect(() => {
+    try {
+      const bc = new BroadcastChannel('halloween_candy_heist_p2p');
+      channelRef.current = bc;
 
-        socket.onopen = () => {
-          if (isCancelled) return;
-          setWsStatus('connected');
-          socket.send(JSON.stringify({
-            type: 'join',
+      bc.onmessage = (event) => {
+        const data = event.data;
+        if (!data) return;
+
+        if (data.type === 'PLAYER_PING') {
+          bc.postMessage({
+            type: 'PLAYER_STATE',
+            player: {
+              id: myId,
+              name: myName,
+              avatar: '🎃',
+              candies: Math.floor(candies),
+              level: playerLevel,
+              lastActive: Date.now()
+            }
+          });
+        } else if (data.type === 'PLAYER_STATE') {
+          const p = data.player;
+          if (p && p.id !== myId) {
+            setOnlinePlayers(prev => {
+              const existingIndex = prev.findIndex(item => item.id === p.id);
+              if (existingIndex >= 0) {
+                const copy = [...prev];
+                copy[existingIndex] = { ...p };
+                return copy;
+              } else {
+                return [...prev, { ...p }];
+              }
+            });
+          }
+        } else if (data.type === 'STEAL_ATTEMPT' && data.targetId === myId) {
+          const stolen = Math.floor(candies * 0.2);
+          if (stolen > 0) {
+            setCandies(c => Math.max(0, c - stolen));
+            playSound('fail');
+            addLog(`🚨 警告！ ${data.thiefName} にあなたのお菓子が ${stolen.toLocaleString()}個 盗まれました！`, 'alert');
+            
+            bc.postMessage({
+              type: 'STEAL_RESPONSE',
+              thiefId: data.thiefId,
+              targetName: myName,
+              success: true,
+              stolen
+            });
+          }
+        } else if (data.type === 'STEAL_RESPONSE' && data.thiefId === myId) {
+          if (data.success) {
+            setCandies(c => c + data.stolen);
+            setTotalCandiesEarned(t => t + data.stolen);
+            playSound('steal');
+            addLog(`🦹‍♂️ P2P強奪成功！ ${data.targetName} から ${data.stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
+          }
+        }
+      };
+
+      const broadcastPresence = () => {
+        bc.postMessage({
+          type: 'PLAYER_STATE',
+          player: {
             id: myId,
             name: myName,
             avatar: '🎃',
             candies: Math.floor(candies),
-            level: playerLevel
-          }));
-        };
+            level: playerLevel,
+            lastActive: Date.now()
+          }
+        });
+      };
 
-        socket.onmessage = (event) => {
-          if (isCancelled) return;
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === 'player_list') {
-              const others = data.players.filter((p: OnlinePlayer) => p.id !== myId);
-              setOnlinePlayers(others);
-            } else if (data.type === 'steal_result') {
-              if (data.success) {
-                setCandies(c => c + data.stolen);
-                setTotalCandiesEarned(t => t + data.stolen);
-                playSound('steal');
-                addLog(`🦹‍♂️ オンライン強奪成功！ ${data.targetName} から ${data.stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
-              } else {
-                addLog(`💥 強奪失敗: ${data.message}`, 'fail');
-              }
-            } else if (data.type === 'robbed_alert') {
-              setCandies(c => Math.max(0, c - data.stolen));
-              playSound('fail');
-              addLog(`🚨 警告！ ${data.thiefName} にあなたのお菓子が ${data.stolen.toLocaleString()}個 盗まれました！`, 'alert');
-            }
-          } catch (e) {}
-        };
+      broadcastPresence();
+      bc.postMessage({ type: 'PLAYER_PING' });
 
-        socket.onerror = () => {
-          if (isCancelled) return;
-          setWsStatus('disconnected');
-        };
+      const presenceTimer = setInterval(broadcastPresence, 3000);
+      const cleanupTimer = setInterval(() => {
+        const now = Date.now();
+        setOnlinePlayers(prev => prev.filter(p => now - p.lastActive < 8000));
+      }, 4000);
 
-        socket.onclose = () => {
-          if (isCancelled) return;
-          setWsStatus('disconnected');
-          // Try reconnecting quietly after 5 seconds if not connected
-          reconnectTimeout = setTimeout(connectWs, 5000);
-        };
-      } catch (e) {
-        if (isCancelled) return;
-        setWsStatus('disconnected');
-        reconnectTimeout = setTimeout(connectWs, 5000);
-      }
-    };
-
-    connectWs();
-
-    return () => {
-      isCancelled = true;
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-      }
-    };
-  }, [myId]);
-
-  // Sync state with server periodically if connected
-  useEffect(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      try {
-        wsRef.current.send(JSON.stringify({
-          type: 'update',
-          candies: Math.floor(candies),
-          level: playerLevel
-        }));
-      } catch (e) {}
-    }
-  }, [candies, playerLevel]);
+      return () => {
+        clearInterval(presenceTimer);
+        clearInterval(cleanupTimer);
+        bc.close();
+      };
+    } catch (e) {}
+  }, [myId, myName, candies, playerLevel]);
 
   // --- AUDIO SYNTHESIZER ---
   const playSound = (type: 'pop' | 'steal' | 'fail' | 'level' | 'buy') => {
@@ -333,7 +342,7 @@ export default function App() {
     localStorage.setItem('hw_achievements', JSON.stringify(achievements.filter(a => a.unlocked).map(a => a.id)));
   }, [candies, totalCandiesEarned, playerLevel, upgrades, achievements]);
 
-  // --- GAME TICK & GRAPH HISTORY ---
+  // --- GAME TICK ---
   useEffect(() => {
     const timer = setInterval(() => {
       if (autoCps > 0) {
@@ -343,18 +352,8 @@ export default function App() {
       }
     }, 100);
 
-    const graphTimer = setInterval(() => {
-      setHistory(prev => {
-        const newPoint = { time: `${Math.floor(Date.now() / 1000) % 60}s`, candies: Math.floor(candies) };
-        return [...prev.slice(-12), newPoint];
-      });
-    }, 3000);
-
-    return () => {
-      clearInterval(timer);
-      clearInterval(graphTimer);
-    };
-  }, [autoCps, candies]);
+    return () => clearInterval(timer);
+  }, [autoCps]);
 
   // --- ACHIEVEMENTS ---
   useEffect(() => {
@@ -440,19 +439,23 @@ export default function App() {
     setCandies(prev => prev - levelUpCost);
     setPlayerLevel(prev => prev + 1);
     playSound('level');
-    addLog(`🎉 プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピングとハイスト効率がアップ！`, 'success');
+    addLog(`🎉 プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピング効率がアップ！`, 'success');
   };
 
   // --- STEAL ACTIONS ---
   const attemptOnlineSteal = (targetId: string) => {
     setHeistCount(prev => prev + 1);
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'steal_attempt',
+    const targetPlayer = onlinePlayers.find(p => p.id === targetId);
+    if (!targetPlayer) return;
+
+    if (channelRef.current) {
+      channelRef.current.postMessage({
+        type: 'STEAL_ATTEMPT',
+        thiefId: myId,
+        thiefName: myName,
         targetId
-      }));
-    } else {
-      addLog(`⚠️ サーバーとの接続が切断されています。オフラインBOTをお楽しみください。`, 'alert');
+      });
+      addLog(`🦹‍♂️ ${targetPlayer.name} の隠れ家に忍び込んでいます...`, 'info');
     }
   };
 
@@ -500,7 +503,6 @@ export default function App() {
     setPlayerLevel(1);
     setUpgrades(DEFAULT_UPGRADES);
     setAchievements(DEFAULT_ACHIEVEMENTS);
-    setHistory([{ time: '0s', candies: 50 }]);
     setClickCount(0);
     setHeistCount(0);
     setRainDrops([]);
@@ -512,7 +514,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-purple-950 via-slate-950 to-black text-slate-100 font-sans pb-16 select-none overflow-x-hidden relative">
+    <div className="min-h-screen bg-gradient-to-b from-purple-950 via-slate-950 to-black text-slate-100 font-sans pb-12 select-none overflow-x-hidden relative flex flex-col">
       
       {/* CANDY RAIN EFFECT */}
       {rainDrops.map(drop => (
@@ -541,63 +543,36 @@ export default function App() {
         </div>
       ))}
 
-      {/* HEADER */}
-      <header className="bg-purple-950/80 backdrop-blur-md border-b border-orange-500/30 sticky top-0 z-40 px-4 py-3 shadow-lg shadow-orange-950/20">
-        <div className="max-w-4xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
+      {/* NEWS TICKER BANNER (COOKIE CLICKER STYLE) */}
+      <div className="bg-purple-950 border-b border-orange-500/30 py-1.5 px-4 text-center text-xs text-amber-300 font-medium overflow-hidden whitespace-nowrap">
+        <span className="animate-pulse mr-2">📢</span>
+        {SPOOKY_NEWS[newsIndex]}
+      </div>
+
+      {/* TOP HEADER */}
+      <header className="bg-purple-950/90 backdrop-blur-md border-b border-orange-500/30 px-4 py-3 shadow-lg shadow-orange-950/20">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-orange-600 flex items-center justify-center shadow-lg shadow-orange-600/50 animate-pulse">
               <Skull className="w-6 h-6 text-black" />
             </div>
             <div>
-              <h1 className="text-lg md:text-xl font-black bg-gradient-to-r from-orange-400 via-amber-300 to-yellow-400 bg-clip-text text-transparent flex items-center gap-2">
-                🎃 Candy Heist Online
+              <h1 className="text-lg md:text-xl font-black bg-gradient-to-r from-orange-400 via-amber-300 to-yellow-400 bg-clip-text text-transparent">
+                🎃 ぬすんでハロウィン！(Cookie Clicker Style)
               </h1>
-              <div className="flex items-center gap-2">
-                <p className="text-xs text-purple-300">{myName} (Lv.{playerLevel})</p>
-                <span className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${wsStatus === 'connected' ? 'bg-green-950/60 text-green-300 border-green-500/30' : 'bg-purple-950/60 text-purple-300 border-purple-500/30'}`}>
-                  {wsStatus === 'connected' ? <Wifi className="w-3 h-3 text-green-400" /> : <WifiOff className="w-3 h-3 text-purple-400" />}
-                  {wsStatus === 'connected' ? 'P2P接続中' : 'オフライン/BOTモード'}
-                </span>
-              </div>
+              <p className="text-xs text-purple-300">{myName} (Lv.{playerLevel})</p>
             </div>
           </div>
 
-          {/* STATS COUNTERS */}
-          <div className="flex items-center gap-4 bg-black/40 px-4 py-2 rounded-2xl border border-purple-500/30">
-            <div className="flex items-center gap-1.5">
-              <span className="text-xl">🍬</span>
-              <div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-purple-300">お菓子数</span>
-                  <button 
-                    onClick={() => setIsResetModalOpen(true)}
-                    className="text-[10px] text-orange-400/80 hover:text-orange-300 underline cursor-pointer"
-                  >
-                    クリア
-                  </button>
-                </div>
-                <div className="text-base md:text-lg font-black text-orange-400">{Math.floor(candies).toLocaleString()}</div>
-              </div>
-            </div>
-            <div className="h-8 w-[1px] bg-purple-500/30" />
-            <div className="flex items-center gap-1.5">
-              <span className="text-xl">⚡</span>
-              <div>
-                <div className="text-xs text-purple-300">自動生産</div>
-                <div className="text-sm md:text-base font-bold text-amber-300">{autoCps.toFixed(1)} /秒</div>
-              </div>
-            </div>
-          </div>
-
-          {/* ACTION BUTTONS */}
+          {/* TOP ACTION BUTTONS */}
           <div className="flex items-center gap-2">
             <button 
               onClick={() => setIsResetModalOpen(true)}
-              className="p-2 rounded-xl bg-red-950/50 hover:bg-red-900/60 text-red-300 border border-red-500/40 transition-all cursor-pointer flex items-center gap-1 text-xs font-bold shadow-md shadow-red-950/40"
+              className="p-2 rounded-xl bg-red-950/50 hover:bg-red-900/60 text-red-300 border border-red-500/40 transition-all cursor-pointer flex items-center gap-1 text-xs font-bold shadow-md"
               title="お菓子やキャッシュをクリア"
             >
               <Trash2 className="w-4 h-4 text-red-400" />
-              <span className="hidden md:inline">キャッシュ消去</span>
+              <span>キャッシュ消去</span>
             </button>
 
             <button 
@@ -611,231 +586,169 @@ export default function App() {
         </div>
       </header>
 
-      {/* NAVIGATION TABS */}
-      <nav className="max-w-4xl mx-auto px-4 mt-4">
-        <div className="grid grid-cols-4 gap-2 bg-purple-950/60 p-1.5 rounded-2xl border border-purple-500/20 backdrop-blur-sm">
-          <button 
-            onClick={() => setActiveTab('pump')}
-            className={`py-2 px-2 rounded-xl text-xs md:text-sm font-bold flex items-center justify-center gap-1 transition-all cursor-pointer ${activeTab === 'pump' ? 'bg-orange-600 text-black shadow-lg shadow-orange-600/30' : 'text-purple-300 hover:bg-purple-900/50'}`}
-          >
-            <span>🎃</span> <span>カボチャ</span>
-          </button>
-          <button 
-            onClick={() => setActiveTab('online')}
-            className={`py-2 px-2 rounded-xl text-xs md:text-sm font-bold flex items-center justify-center gap-1 transition-all cursor-pointer ${activeTab === 'online' ? 'bg-orange-600 text-black shadow-lg shadow-orange-600/30' : 'text-purple-300 hover:bg-purple-900/50'}`}
-          >
-            <span>🌐</span> <span>強奪 ({onlinePlayers.length + offlineBots.length})</span>
-          </button>
-          <button 
-            onClick={() => setActiveTab('shop')}
-            className={`py-2 px-2 rounded-xl text-xs md:text-sm font-bold flex items-center justify-center gap-1 transition-all cursor-pointer ${activeTab === 'shop' ? 'bg-orange-600 text-black shadow-lg shadow-orange-600/30' : 'text-purple-300 hover:bg-purple-900/50'}`}
-          >
-            <span>🛍️</span> <span>ショップ</span>
-          </button>
-          <button 
-            onClick={() => setActiveTab('achievements')}
-            className={`py-2 px-2 rounded-xl text-xs md:text-sm font-bold flex items-center justify-center gap-1 transition-all cursor-pointer ${activeTab === 'achievements' ? 'bg-orange-600 text-black shadow-lg shadow-orange-600/30' : 'text-purple-300 hover:bg-purple-900/50'}`}
-          >
-            <span>🏆</span> <span>実績</span>
-          </button>
-        </div>
-      </nav>
-
-      {/* MAIN CONTAINER */}
-      <main className="max-w-4xl mx-auto px-4 mt-6">
+      {/* --- COOKIE CLICKER 3-COLUMN LAYOUT --- */}
+      <div className="max-w-7xl mx-auto px-4 mt-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 w-full">
         
-        {/* TAB 1: PUMPKIN & GRAPH & LEVEL */}
-        {activeTab === 'pump' && (
-          <div className="space-y-6">
-            
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              
-              {/* LEVEL UP PANEL */}
-              <div className="bg-purple-900/30 border border-purple-500/30 rounded-3xl p-5 backdrop-blur-md flex flex-col justify-between shadow-xl">
-                <div>
-                  <h2 className="text-base font-bold text-orange-400 flex items-center gap-2 mb-3">
-                    <TrendingUp className="w-5 h-5" /> プレイヤーレベル (調整済)
-                  </h2>
-                  <div className="bg-black/40 p-4 rounded-2xl border border-purple-500/20 mb-4">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="text-sm text-purple-300">現在のレベル</span>
-                      <span className="text-xl font-black text-amber-300">Lv. {playerLevel}</span>
-                    </div>
-                    <div className="text-xs text-slate-400 mb-3">
-                      タップ効率: <span className="text-orange-400 font-bold">+{(clickPower * (1 + (playerLevel - 1) * 0.05)).toFixed(1)}</span> / 回
-                    </div>
-                    <button 
-                      onClick={handleLevelUp}
-                      disabled={candies < levelUpCost}
-                      className={`w-full py-3 px-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all cursor-pointer ${candies >= levelUpCost ? 'bg-gradient-to-r from-orange-500 to-amber-500 text-black hover:opacity-90 shadow-lg shadow-orange-500/30' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
-                    >
-                      <Sparkles className="w-4 h-4" /> 昇格する ({levelUpCost.toLocaleString()} 🍬)
-                    </button>
-                  </div>
-                </div>
-
-                <div className="bg-purple-950/60 p-4 rounded-2xl border border-purple-500/20 text-xs text-purple-300 leading-relaxed">
-                  💡 カボチャをクリックすると、お菓子の雨が飛び出します！強奪タブからオンラインユーザーやオフラインBOTを襲ってキャンディを奪い取ろう！
-                </div>
-              </div>
-
-              {/* CENTER: PUMPKIN CLICKER WITH RAIN */}
-              <div className="bg-purple-900/20 border border-orange-500/30 rounded-3xl p-6 backdrop-blur-md flex flex-col items-center justify-center shadow-2xl relative overflow-hidden min-h-[360px]">
-                <div className="absolute top-4 text-center">
-                  <span className="text-xs uppercase tracking-widest text-orange-400/80 font-bold">ジャック・オー・ランタン</span>
-                  <p className="text-xs text-purple-300">クリックでお菓子が飛び出す！</p>
-                </div>
-
-                <div 
-                  onClick={handlePumpkinClick}
-                  onTouchStart={handlePumpkinClick}
-                  className={`cursor-pointer transition-transform duration-100 select-none relative my-8 group ${isPumpActive ? 'scale-90 rotate-3' : 'hover:scale-105 active:scale-95'}`}
-                >
-                  <div className="absolute inset-0 bg-orange-500/30 rounded-full blur-2xl group-hover:bg-orange-500/50 transition-all" />
-                  <div className="relative text-8xl md:text-9xl filter drop-shadow-[0_10px_15px_rgba(255,117,24,0.4)] animate-bounce-slow">
-                    🎃
-                  </div>
-                </div>
-
-                <div className="text-xs text-slate-400 text-center bg-black/50 px-4 py-1.5 rounded-full border border-purple-500/20">
-                  クリック威力: <span className="text-orange-400 font-bold">+{clickPower}</span> 🍬
-                </div>
-              </div>
-
-              {/* EVENT LOGS */}
-              <div className="bg-purple-900/30 border border-purple-500/30 rounded-3xl p-5 backdrop-blur-md flex flex-col shadow-xl">
-                <h2 className="text-base font-bold text-orange-400 flex items-center gap-2 mb-3">
-                  <Flame className="w-5 h-5 text-orange-500" /> ハロウィン事件簿
-                </h2>
-                <div className="flex-1 bg-black/50 rounded-2xl p-3 border border-purple-500/20 overflow-y-auto max-h-[280px] space-y-2 text-xs">
-                  {logs.map(log => (
-                    <div key={log.id} className={`p-2 rounded-xl border ${log.type === 'success' ? 'bg-green-950/40 border-green-500/30 text-green-200' : log.type === 'fail' ? 'bg-red-950/40 border-red-500/30 text-red-200' : log.type === 'alert' ? 'bg-orange-950/40 border-orange-500/30 text-orange-200' : 'bg-purple-950/40 border-purple-500/30 text-purple-200'}`}>
-                      <div className="flex justify-between text-[10px] text-slate-400 mb-0.5">
-                        <span>{log.time}</span>
-                      </div>
-                      <div>{log.text}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
+        {/* COLUMN 1: LEFT PANE (THE PUMPKIN CLICKER & STATS) */}
+        <div className="lg:col-span-4 bg-purple-950/50 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md flex flex-col items-center justify-between shadow-2xl relative overflow-hidden min-h-[500px]">
+          
+          <div className="text-center w-full">
+            <h2 className="text-sm uppercase tracking-widest text-orange-400 font-bold mb-1">ジャック・オー・ランタン</h2>
+            <div className="text-3xl md:text-4xl font-black text-orange-400 drop-shadow-[0_2px_8px_rgba(255,117,24,0.5)]">
+              {Math.floor(candies).toLocaleString()} <span className="text-xl">🍬</span>
             </div>
-
-            {/* CANDY GROWTH GRAPH (FIXED NUMERIC SVG VIEWBOX) */}
-            <div className="bg-purple-900/30 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-xl">
-              <h2 className="text-base font-bold text-orange-400 flex items-center gap-2 mb-2">
-                <TrendingUp className="w-5 h-5" /> キャンディ成長の軌跡 (リアルタイムグラフ)
-              </h2>
-              <p className="text-xs text-purple-300 mb-4">時間の経過とともにキャンディがどれくらい増えているかを視覚化しています。</p>
-
-              <div className="bg-black/50 p-4 rounded-2xl border border-purple-500/25 h-48 relative flex items-end">
-                {history.length > 1 ? (
-                  <svg className="w-full h-full overflow-visible" viewBox="0 0 300 150" preserveAspectRatio="none">
-                    <line x1="0" y1="30" x2="300" y2="30" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
-                    <line x1="0" y1="90" x2="300" y2="90" stroke="#4a1d96" strokeDasharray="4" strokeWidth="1" />
-                    
-                    {(() => {
-                      const maxVal = Math.max(...history.map(h => h.candies), 100);
-                      const minVal = Math.min(...history.map(h => h.candies), 0);
-                      const range = maxVal - minVal || 1;
-                      const points = history.map((h, idx) => {
-                        const x = (idx / (history.length - 1)) * 300;
-                        const y = 150 - ((h.candies - minVal) / range) * 120 - 15;
-                        return `${x},${y}`;
-                      }).join(' ');
-
-                      return (
-                        <>
-                          <polyline
-                            fill="none"
-                            stroke="#ff9933"
-                            strokeWidth="3"
-                            points={points}
-                            className="transition-all duration-300"
-                          />
-                          {history.map((h, idx) => {
-                            const x = (idx / (history.length - 1)) * 300;
-                            const y = 150 - ((h.candies - minVal) / range) * 120 - 15;
-                            return (
-                              <circle
-                                key={idx}
-                                cx={x}
-                                cy={y}
-                                r="4"
-                                fill="#fbbf24"
-                                className="transition-all duration-300"
-                              />
-                            );
-                          })}
-                        </>
-                      );
-                    })()}
-                  </svg>
-                ) : (
-                  <div className="w-full text-center text-xs text-purple-400">データを収集中...</div>
-                )}
-              </div>
-              <div className="flex justify-between text-[11px] text-purple-400 mt-2 px-1">
-                <span>過去の推移</span>
-                <span className="font-bold text-orange-400">現在: {Math.floor(candies).toLocaleString()} 🍬</span>
-              </div>
-            </div>
-
+            <p className="text-xs text-purple-300 mt-1">
+              秒間生産 (CPS): <span className="text-amber-300 font-bold">{autoCps.toFixed(1)}</span>
+            </p>
           </div>
-        )}
 
-        {/* TAB 2: ONLINE PLAYERS & OFFLINE BOTS (SEPARATE SECTIONS) */}
-        {activeTab === 'online' && (
-          <div className="space-y-8">
+          {/* GIANT CLICKABLE PUMPKIN */}
+          <div 
+            onClick={handlePumpkinClick}
+            onTouchStart={handlePumpkinClick}
+            className={`cursor-pointer transition-transform duration-100 select-none relative my-6 group ${isPumpActive ? 'scale-90 rotate-3' : 'hover:scale-105 active:scale-95'}`}
+          >
+            <div className="absolute inset-0 bg-orange-500/30 rounded-full blur-3xl group-hover:bg-orange-500/50 transition-all" />
+            <div className="relative text-9xl md:text-[10rem] filter drop-shadow-[0_15px_25px_rgba(255,117,24,0.5)] animate-bounce-slow">
+              🎃
+            </div>
+          </div>
+
+          {/* PLAYER LEVEL & UPGRADE PROMOTION */}
+          <div className="w-full bg-black/50 p-4 rounded-2xl border border-purple-500/30 space-y-3">
+            <div className="flex justify-between items-center text-xs">
+              <span className="text-purple-300">プレイヤーレベル</span>
+              <span className="font-black text-amber-300 text-sm">Lv. {playerLevel}</span>
+            </div>
+            <div className="text-[11px] text-slate-400">
+              クリック威力: <span className="text-orange-400 font-bold">+{clickPower}</span> 🍬
+            </div>
+            <button 
+              onClick={handleLevelUp}
+              disabled={candies < levelUpCost}
+              className={`w-full py-2.5 px-3 rounded-xl font-bold flex items-center justify-center gap-2 text-xs transition-all cursor-pointer ${candies >= levelUpCost ? 'bg-gradient-to-r from-orange-500 to-amber-500 text-black hover:opacity-90 shadow-lg shadow-orange-500/30' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
+            >
+              <Sparkles className="w-3.5 h-3.5" /> 昇格する ({levelUpCost.toLocaleString()} 🍬)
+            </button>
+          </div>
+
+          {/* CANDY GROWTH GRAPH */}
+          <div className="w-full bg-black/40 p-3 rounded-2xl border border-purple-500/20 mt-3">
+            <div className="flex justify-between items-center text-[11px] text-purple-300 mb-1">
+              <span className="flex items-center gap-1 font-bold text-orange-400">
+                <TrendingUp className="w-3.5 h-3.5" /> 収穫トレンド (グラフ)
+              </span>
+              <span>直近の推移</span>
+            </div>
+            <div className="h-16 w-full relative">
+              <svg className="w-full h-full overflow-visible" viewBox="0 0 200 60" preserveAspectRatio="none">
+                {candyHistory.length > 1 && (() => {
+                  const min = Math.min(...candyHistory);
+                  const max = Math.max(...candyHistory, min + 1);
+                  const range = max - min || 1;
+                  const points = candyHistory.map((val, idx) => {
+                    const x = (idx / (candyHistory.length - 1)) * 200;
+                    const y = 55 - ((val - min) / range) * 50;
+                    return `${x},${isNaN(y) ? 30 : y}`;
+                  }).join(' ');
+                  return (
+                    <polyline
+                      fill="none"
+                      stroke="#f97316"
+                      strokeWidth="2.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      points={points}
+                    />
+                  );
+                })()}
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* COLUMN 2: CENTER PANE (BUILDINGS & UPGRADES STORE - COOKIE CLICKER SHOP) */}
+        <div className="lg:col-span-4 bg-purple-950/50 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md flex flex-col shadow-2xl max-h-[650px] overflow-hidden">
+          <div className="flex items-center justify-between mb-4 pb-2 border-b border-purple-500/20">
+            <h2 className="text-base font-black text-orange-400 flex items-center gap-2">
+              <ShoppingBag className="w-5 h-5" /> ストア (お菓子の魔術)
+            </h2>
+            <span className="text-xs text-purple-300">ショップ</span>
+          </div>
+
+          <div className="flex-1 overflow-y-auto space-y-3 pr-1">
+            {upgrades.map(upgrade => {
+              const canAfford = candies >= upgrade.cost;
+              return (
+                <div 
+                  key={upgrade.id} 
+                  onClick={() => canAfford && buyUpgrade(upgrade.id)}
+                  className={`p-3 rounded-2xl border transition-all flex items-center justify-between gap-3 ${canAfford ? 'bg-black/60 border-orange-500/40 hover:border-orange-400 cursor-pointer shadow-md' : 'bg-black/30 border-purple-500/20 opacity-60 cursor-not-allowed'}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="text-3xl p-2 bg-purple-950 rounded-xl border border-purple-500/30">
+                      {upgrade.type === 'click' ? '🪄' : upgrade.type === 'auto' ? '👻' : upgrade.type === 'stealth' ? '🗡️' : '🔥'}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="font-bold text-xs text-orange-300">{upgrade.name}</h3>
+                        <span className="text-[10px] bg-purple-900 px-1.5 py-0.5 rounded text-purple-200">Lv.{upgrade.level}</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400">{upgrade.description}</p>
+                      <div className="text-xs font-bold text-amber-300 mt-1">
+                        {Math.floor(upgrade.cost).toLocaleString()} 🍬
+                      </div>
+                    </div>
+                  </div>
+
+                  <button 
+                    disabled={!canAfford}
+                    className={`py-1.5 px-3 rounded-xl font-bold text-xs whitespace-nowrap ${canAfford ? 'bg-orange-500 text-black hover:bg-orange-400' : 'bg-gray-800 text-gray-500'}`}
+                  >
+                    購入
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* COLUMN 3: RIGHT PANE (ONLINE P2P PLAYERS & OFFLINE BOTS HEIST) */}
+        <div className="lg:col-span-4 bg-purple-950/50 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md flex flex-col shadow-2xl max-h-[650px] overflow-hidden">
+          <div className="flex items-center justify-between mb-4 pb-2 border-b border-purple-500/20">
+            <h2 className="text-base font-black text-orange-400 flex items-center gap-2">
+              <Users className="w-5 h-5" /> 強奪ターゲット (ハイスト)
+            </h2>
+            <span className="text-xs text-green-400 font-bold">P2P連動</span>
+          </div>
+
+          <div className="flex-1 overflow-y-auto space-y-4 pr-1">
             
-            {/* SECTION 1: REAL ONLINE PLAYERS */}
-            <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 mb-6">
-                <div>
-                  <h2 className="text-xl font-black text-orange-400 flex items-center gap-2">
-                    <Users className="w-6 h-6 text-green-400" /> 🌐 オンラインプレイヤー (リアルタイム)
-                  </h2>
-                  <p className="text-xs text-purple-300">同じ世界に接続している実際のプレイヤーたちです。</p>
-                </div>
-                <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300 flex items-center gap-2">
-                  <span>状態:</span>
-                  <span className={wsStatus === 'connected' ? 'text-green-400 font-bold' : 'text-purple-400 font-bold'}>
-                    {wsStatus === 'connected' ? '接続中' : 'オフライン (BOTモード利用可能)'}
-                  </span>
-                </div>
-              </div>
-
+            {/* ONLINE PLAYERS SUBSECTION */}
+            <div>
+              <h3 className="text-xs font-bold text-green-300 mb-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-green-400 animate-ping" /> オンラインプレイヤー ({onlinePlayers.length})
+              </h3>
               {onlinePlayers.length === 0 ? (
-                <div className="bg-black/40 border border-purple-500/30 p-8 rounded-2xl text-center text-purple-300">
-                  <Ghost className="w-10 h-10 mx-auto mb-2 opacity-50 animate-bounce" />
-                  <p className="text-sm font-bold mb-1">現在オンラインの他のプレイヤーはいません</p>
-                  <p className="text-xs text-slate-400">別のタブやブラウザでこのアプリを開くと、ここにリアルプレイヤーが表示されます。</p>
+                <div className="bg-black/30 border border-purple-500/20 p-3 rounded-xl text-center text-xs text-slate-400 mb-3">
+                  別タブで開くとリアルタイム同期します
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-2 mb-3">
                   {onlinePlayers.map(player => (
-                    <div key={player.id} className="bg-black/40 border border-green-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-green-500/60 transition-all">
-                      <div className="flex items-center gap-3">
-                        <div className="text-4xl p-2 bg-purple-950 rounded-2xl border border-purple-500/30">
-                          {player.avatar}
-                        </div>
+                    <div key={player.id} className="bg-black/50 border border-green-500/30 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-2xl">{player.avatar}</span>
                         <div>
-                          <div className="flex items-center gap-2">
-                            <h3 className="font-bold text-sm text-green-300">{player.name}</h3>
-                            <span className="text-[10px] bg-green-950 text-green-300 px-1.5 py-0.5 rounded border border-green-500/40">オンライン</span>
-                          </div>
-                          <p className="text-xs text-purple-300">Lv.{player.level} プレイヤー</p>
-                          <p className="text-xs font-bold text-amber-400 mt-1">
-                            所持: {player.candies.toLocaleString()} 🍬
-                          </p>
+                          <div className="font-bold text-xs text-green-300">{player.name}</div>
+                          <div className="text-[10px] text-amber-400">{player.candies.toLocaleString()} 🍬</div>
                         </div>
                       </div>
-
                       <button 
                         onClick={() => attemptOnlineSteal(player.id)}
-                        className="py-2 px-4 rounded-xl font-bold bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-black text-xs md:text-sm shadow-lg shadow-green-600/30 transition-all cursor-pointer active:scale-95 whitespace-nowrap"
+                        className="py-1 px-2.5 rounded-lg font-bold bg-green-600 hover:bg-green-500 text-black text-[11px]"
                       >
-                        🦹‍♂️ 盗む
+                        盗む
                       </button>
                     </div>
                   ))}
@@ -843,44 +756,26 @@ export default function App() {
               )}
             </div>
 
-            {/* SECTION 2: OFFLINE BOTS / RIVALS */}
-            <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 mb-6">
-                <div>
-                  <h2 className="text-xl font-black text-orange-400 flex items-center gap-2">
-                    <Skull className="w-6 h-6 text-orange-400" /> 👻 オフラインBOT / ハロウィンライバル
-                  </h2>
-                  <p className="text-xs text-purple-300">いつでも対戦・強奪できる強力なオフラインキャラクターたちです。</p>
-                </div>
-                <div className="bg-black/50 px-3 py-1.5 rounded-xl border border-purple-500/30 text-xs text-amber-300">
-                  常時稼働
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* OFFLINE BOTS SUBSECTION */}
+            <div>
+              <h3 className="text-xs font-bold text-orange-300 mb-2 flex items-center gap-1.5">
+                <Skull className="w-3.5 h-3.5 text-orange-400" /> オフラインBOT / ライバル ({offlineBots.length})
+              </h3>
+              <div className="space-y-2">
                 {offlineBots.map(bot => (
-                  <div key={bot.id} className="bg-black/40 border border-purple-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-orange-500/50 transition-all">
-                    <div className="flex items-center gap-3">
-                      <div className="text-4xl p-2 bg-purple-950 rounded-2xl border border-purple-500/30">
-                        {bot.avatar}
-                      </div>
+                  <div key={bot.id} className="bg-black/50 border border-purple-500/30 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-2xl">{bot.avatar}</span>
                       <div>
-                        <div className="flex items-center gap-2">
-                          <h3 className="font-bold text-sm text-orange-300">{bot.name}</h3>
-                          <span className="text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.5 rounded border border-purple-500/40">BOT</span>
-                        </div>
-                        <p className="text-xs text-purple-300">Lv.{bot.level} ライバル</p>
-                        <p className="text-xs font-bold text-amber-400 mt-1">
-                          所持: {bot.candies.toLocaleString()} 🍬
-                        </p>
+                        <div className="font-bold text-xs text-orange-300">{bot.name}</div>
+                        <div className="text-[10px] text-amber-400">{bot.candies.toLocaleString()} 🍬</div>
                       </div>
                     </div>
-
                     <button 
                       onClick={() => attemptBotSteal(bot.id)}
-                      className="py-2 px-4 rounded-xl font-bold bg-gradient-to-r from-orange-600 to-amber-600 hover:from-orange-500 hover:to-amber-500 text-black text-xs md:text-sm shadow-lg shadow-orange-600/30 transition-all cursor-pointer active:scale-95 whitespace-nowrap"
+                      className="py-1 px-2.5 rounded-lg font-bold bg-orange-600 hover:bg-orange-500 text-black text-[11px]"
                     >
-                      🦹‍♂️ 盗む
+                      盗む
                     </button>
                   </div>
                 ))}
@@ -888,85 +783,26 @@ export default function App() {
             </div>
 
           </div>
-        )}
+        </div>
 
-        {/* TAB 3: SHOP */}
-        {activeTab === 'shop' && (
-          <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
-            <h2 className="text-xl font-black text-orange-400 flex items-center gap-2 mb-2">
-              <ShoppingBag className="w-6 h-6" /> ハロウィンショップ
-            </h2>
-            <p className="text-xs text-purple-300 mb-6">お菓子を消費して、クリックパワーや自動生産を強化しよう！</p>
+      </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {upgrades.map(upgrade => {
-                const canAfford = candies >= upgrade.cost;
-                return (
-                  <div key={upgrade.id} className="bg-black/40 border border-purple-500/30 rounded-2xl p-4 flex items-center justify-between gap-4 hover:border-orange-500/50 transition-all">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-lg">
-                          {upgrade.type === 'click' ? '🪄' : upgrade.type === 'auto' ? '👻' : upgrade.type === 'stealth' ? '🗡️' : '🔥'}
-                        </span>
-                        <h3 className="font-bold text-sm text-orange-300">{upgrade.name}</h3>
-                        <span className="text-xs bg-purple-950 px-2 py-0.5 rounded-full border border-purple-500/30 text-purple-300">Lv.{upgrade.level}</span>
-                      </div>
-                      <p className="text-xs text-slate-400 mb-2">{upgrade.description}</p>
-                      <div className="text-xs font-bold text-amber-300">
-                        価格: <span className="text-orange-400">{Math.floor(upgrade.cost).toLocaleString()} 🍬</span>
-                      </div>
-                    </div>
-
-                    <button 
-                      onClick={() => buyUpgrade(upgrade.id)}
-                      disabled={!canAfford}
-                      className={`py-2 px-4 rounded-xl font-bold text-xs md:text-sm whitespace-nowrap transition-all cursor-pointer ${canAfford ? 'bg-gradient-to-r from-orange-500 to-amber-500 text-black hover:opacity-90 shadow-lg shadow-orange-500/30' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
-                    >
-                      購入
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+      {/* EVENT LOGS / TICKER AT BOTTOM */}
+      <div className="max-w-7xl mx-auto px-4 mt-6 w-full">
+        <div className="bg-purple-900/30 border border-purple-500/30 rounded-2xl p-4 backdrop-blur-md shadow-lg">
+          <h2 className="text-xs font-bold text-orange-400 flex items-center gap-2 mb-2">
+            <Flame className="w-4 h-4 text-orange-500" /> ハロウィン事件簿 (ログ)
+          </h2>
+          <div className="bg-black/50 rounded-xl p-3 border border-purple-500/20 overflow-y-auto max-h-[120px] space-y-1.5 text-xs">
+            {logs.map(log => (
+              <div key={log.id} className={`p-1.5 rounded-lg border ${log.type === 'success' ? 'bg-green-950/40 border-green-500/30 text-green-200' : log.type === 'fail' ? 'bg-red-950/40 border-red-500/30 text-red-200' : log.type === 'alert' ? 'bg-orange-950/40 border-orange-500/30 text-orange-200' : 'bg-purple-950/40 border-purple-500/30 text-purple-200'}`}>
+                <span className="text-[10px] text-slate-400 mr-2">[{log.time}]</span>
+                <span>{log.text}</span>
+              </div>
+            ))}
           </div>
-        )}
-
-        {/* TAB 4: ACHIEVEMENTS */}
-        {activeTab === 'achievements' && (
-          <div className="bg-purple-900/20 border border-purple-500/30 rounded-3xl p-6 backdrop-blur-md shadow-2xl">
-            <h2 className="text-xl font-black text-orange-400 flex items-center gap-2 mb-2">
-              <Trophy className="w-6 h-6" /> 実績一覧
-            </h2>
-            <p className="text-xs text-purple-300 mb-6">条件を達成してお菓子ボーナスをゲットしよう！</p>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {achievements.map(ach => (
-                <div key={ach.id} className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${ach.unlocked ? 'bg-purple-950/60 border-orange-500/40 text-purple-100' : 'bg-black/30 border-purple-500/20 text-slate-500 opacity-60'}`}>
-                  <div className="flex items-center gap-3">
-                    <div className={`text-3xl p-2 rounded-xl ${ach.unlocked ? 'bg-orange-600/20 border border-orange-500/40' : 'bg-gray-800'}`}>
-                      {ach.unlocked ? '🏆' : '🔒'}
-                    </div>
-                    <div>
-                      <h3 className={`font-bold text-sm ${ach.unlocked ? 'text-orange-300' : 'text-slate-400'}`}>{ach.title}</h3>
-                      <p className="text-xs text-slate-400">{ach.description}</p>
-                      <div className="text-xs text-amber-400 mt-1 font-bold">報酬: +{ach.reward} 🍬</div>
-                    </div>
-                  </div>
-
-                  <div>
-                    {ach.unlocked ? (
-                      <span className="text-xs bg-green-950 text-green-300 px-3 py-1 rounded-full border border-green-500/30 font-bold">達成済</span>
-                    ) : (
-                      <span className="text-xs bg-gray-900 text-gray-400 px-3 py-1 rounded-full border border-gray-700">未達成</span>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-      </main>
+        </div>
+      </div>
 
       {/* CLEAR / RESET MODAL */}
       {isResetModalOpen && (
@@ -974,7 +810,7 @@ export default function App() {
           <div className="bg-gradient-to-b from-purple-950 to-slate-950 border border-red-500/40 rounded-3xl p-6 max-w-md w-full shadow-2xl relative text-slate-100">
             <button 
               onClick={() => setIsResetModalOpen(false)}
-              className="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-white hover:bg-white/10 transition-all cursor-pointer"
+              className="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-white hover:bg-white/15 transition-all cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -1035,8 +871,8 @@ export default function App() {
         </div>
       )}
 
-      <footer className="max-w-4xl mx-auto px-4 mt-12 text-center text-xs text-purple-400/60">
-        Halloween Candy Heist Online &copy; 2026 - P2P Multiplayer Clicker
+      <footer className="max-w-7xl mx-auto px-4 mt-8 text-center text-xs text-purple-400/60">
+        Halloween Candy Heist &copy; 2026 - Cookie Clicker Inspired Layout
       </footer>
 
     </div>
