@@ -16,7 +16,7 @@ async function startServer() {
   app.use(express.json());
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server });
+  const wss = new WebSocketServer({ server, path: '/ws' });
 
   interface OnlinePlayer {
     id: string;
@@ -60,9 +60,9 @@ async function startServer() {
           players.set(playerId, {
             id: playerId,
             name: data.name || `お菓子泥棒_${Math.floor(Math.random() * 900 + 100)}`,
-            avatar: data.avatar || '🎃',
-            candies: data.candies || 50,
-            level: data.level || 1,
+            avatar: data.avatar || 'pumpkin',
+            candies: data.candies ?? 50,
+            level: data.level ?? 1,
             ws,
             isAlive: true
           });
@@ -73,6 +73,35 @@ async function startServer() {
             p.candies = data.candies;
             p.level = data.level;
             broadcastPlayers();
+          }
+        } else if (data.type === 'gift') {
+          const sender = players.get(playerId);
+          const target = players.get(data.targetId);
+          const amount = Math.floor(Number(data.amount));
+
+          if (!sender || !target || target.id === sender.id) {
+            ws.send(JSON.stringify({ type: 'gift_result', success: false, message: '相手が見つかりません' }));
+          } else if (!Number.isFinite(amount) || amount <= 0 || amount > sender.candies) {
+            ws.send(JSON.stringify({ type: 'gift_result', success: false, message: 'お菓子の数が正しくありません' }));
+          } else {
+            sender.candies -= amount;
+            target.candies += amount;
+            broadcastPlayers();
+
+            ws.send(JSON.stringify({
+              type: 'gift_result',
+              success: true,
+              targetName: target.name,
+              amount
+            }));
+
+            if (target.ws.readyState === WebSocket.OPEN) {
+              target.ws.send(JSON.stringify({
+                type: 'gift_received',
+                senderName: sender.name,
+                amount
+              }));
+            }
           }
         } else if (data.type === 'steal_attempt') {
           const targetId = data.targetId;

@@ -8,8 +8,9 @@ import {
   Sparkles, Skull, Ghost, Flame, Shield, Award, Zap, 
   Volume2, VolumeX, RefreshCw, Trophy, ShoppingBag, 
   Users, TrendingUp, AlertCircle, CheckCircle2, CloudRain,
-  RotateCcw, Trash2, X, AlertTriangle, Wifi
+  RotateCcw, Trash2, X, AlertTriangle, Wifi, Gift, Repeat
 } from 'lucide-react';
+import { Sprite, LogIcon, type SpriteName, type LogIconName } from './icons';
 
 // --- TYPES ---
 interface Upgrade {
@@ -27,16 +28,15 @@ interface Upgrade {
 interface OnlinePlayer {
   id: string;
   name: string;
-  avatar: string;
+  avatar: SpriteName;
   candies: number;
   level: number;
-  lastActive: number;
 }
 
 interface BotRival {
   id: string;
   name: string;
-  avatar: string;
+  avatar: SpriteName;
   candies: number;
   level: number;
 }
@@ -54,7 +54,7 @@ interface RainDrop {
   x: number;
   speed: number;
   size: number;
-  emoji: string;
+  sprite: SpriteName;
 }
 
 interface Achievement {
@@ -71,6 +71,7 @@ interface LogEntry {
   time: string;
   text: string;
   type: 'success' | 'fail' | 'info' | 'alert';
+  icon?: LogIconName;
 }
 
 let uniqueIdCounter = 0;
@@ -95,19 +96,41 @@ const DEFAULT_ACHIEVEMENTS: Achievement[] = [
 ];
 
 const OFFLINE_BOTS: BotRival[] = [
-  { id: 'bot_lilly', name: '魔女のリリー', avatar: '🧙‍♀️', candies: 650, level: 4 },
-  { id: 'bot_jack', name: '吸血鬼ジャック', avatar: '🧛‍♂️', candies: 2800, level: 9 },
-  { id: 'bot_grim', name: '死神グリム', avatar: '💀', candies: 12500, level: 16 },
-  { id: 'bot_popo', name: 'おばけのポポ', avatar: '👻', candies: 180, level: 2 },
+  { id: 'bot_lilly', name: '魔女のリリー', avatar: 'witch', candies: 650, level: 4 },
+  { id: 'bot_jack', name: '吸血鬼ジャック', avatar: 'vampire', candies: 2800, level: 9 },
+  { id: 'bot_grim', name: '死神グリム', avatar: 'skull', candies: 12500, level: 16 },
+  { id: 'bot_popo', name: 'おばけのポポ', avatar: 'ghost', candies: 180, level: 2 },
 ];
 
-const SPOOKY_NEWS = [
-  '🎃 速報: 巨大なカボチャから甘い魔力が溢れ出しています！',
-  '🧙‍♀️ 魔女のリリーがあなたの隠しストックを狙って夜空を飛んでいます。',
-  '👻 おばけたちが夜通しキャンディを集め続けています。',
-  '🦇 コウモリの群れが隣町のハロウィン会場からお菓子を強奪中！',
-  '🌙 ブラッドムーンの夜、スリの成功率がわずかに上昇中…？'
+const SPOOKY_NEWS: { icon: SpriteName; text: string }[] = [
+  { icon: 'pumpkin', text: '速報: 巨大なカボチャから甘い魔力が溢れ出しています！' },
+  { icon: 'witch', text: '魔女のリリーがあなたの隠しストックを狙って夜空を飛んでいます。' },
+  { icon: 'ghost', text: 'おばけたちが夜通しキャンディを集め続けています。' },
+  { icon: 'bat', text: 'コウモリの群れが隣町のハロウィン会場からお菓子を強奪中！' },
+  { icon: 'moon', text: 'ブラッドムーンの夜、スリの成功率がわずかに上昇中…？' }
 ];
+
+const RAIN_SPRITES: SpriteName[] = ['candy', 'chocolate', 'lollipop', 'star', 'pumpkin'];
+
+const UPGRADE_SPRITES: Record<Upgrade['type'], SpriteName> = {
+  click: 'wand',
+  auto: 'ghost',
+  stealth: 'dagger',
+  special: 'fire',
+};
+
+// Sell-back returns half of what the most recent level cost
+const SELL_REFUND_RATE = 0.5;
+
+const costAtLevel = (upgradeId: string, level: number) => {
+  const base = DEFAULT_UPGRADES.find(u => u.id === upgradeId);
+  if (!base) return 0;
+  let cost = base.cost;
+  for (let i = 0; i < level; i++) cost = Math.floor(cost * base.costMultiplier);
+  return cost;
+};
+
+const getWsUrl = () => `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 
 export default function App() {
   const [candies, setCandies] = useState<number>(() => {
@@ -127,6 +150,8 @@ export default function App() {
 
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [isResetModalOpen, setIsResetModalOpen] = useState<boolean>(false);
+  const [giftTargetId, setGiftTargetId] = useState<string | null>(null);
+  const [giftAmount, setGiftAmount] = useState<string>('100');
   const [newsIndex, setNewsIndex] = useState<number>(0);
 
   // Floating & Rain
@@ -143,13 +168,19 @@ export default function App() {
     return () => clearInterval(historyTimer);
   }, [candies]);
 
-  // My Player Info for BroadcastChannel P2P
+  // My Player Info for WebSocket multiplayer
   const [myId] = useState<string>(() => getUniqueId());
   const [myName] = useState<string>(() => `お菓子泥棒_${Math.floor(Math.random() * 900 + 100)}`);
   const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayer[]>([]);
   const [offlineBots, setOfflineBots] = useState<BotRival[]>(OFFLINE_BOTS);
-  
-  const channelRef = useRef<BroadcastChannel | null>(null);
+  const [connStatus, setConnStatus] = useState<'connecting' | 'online' | 'offline'>('connecting');
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const candiesRef = useRef(candies);
+  const levelRef = useRef(playerLevel);
+  const wsHandlerRef = useRef<(data: any) => void>(() => {});
+  candiesRef.current = candies;
+  levelRef.current = playerLevel;
 
   // Upgrades State
   const [upgrades, setUpgrades] = useState<Upgrade[]>(() => {
@@ -191,97 +222,93 @@ export default function App() {
     return () => clearInterval(ticker);
   }, []);
 
-  // --- BROADCASTCHANNEL P2P SYNC ---
+  // --- WEBSOCKET MULTIPLAYER SYNC ---
+  // Re-assigned every render so the handler always sees the latest state/settings
+  wsHandlerRef.current = (data: any) => {
+    if (data.type === 'player_list') {
+      setOnlinePlayers((data.players as OnlinePlayer[]).filter(p => p.id !== myId));
+    } else if (data.type === 'robbed_alert') {
+      setCandies(c => Math.max(0, c - data.stolen));
+      playSound('fail');
+      addLog(`警告！ ${data.thiefName} にあなたのお菓子が ${data.stolen.toLocaleString()}個 盗まれました！`, 'alert', 'siren');
+    } else if (data.type === 'gift_result') {
+      if (data.success) {
+        setCandies(c => Math.max(0, c - data.amount));
+        playSound('buy');
+        addLog(`${data.targetName} に ${data.amount.toLocaleString()}個 のお菓子を贈りました！`, 'success', 'gift');
+      } else {
+        playSound('fail');
+        addLog(`贈呈できませんでした… ${data.message ?? ''}`, 'fail', 'warning');
+      }
+    } else if (data.type === 'gift_received') {
+      setCandies(c => c + data.amount);
+      setTotalCandiesEarned(t => t + data.amount);
+      playSound('level');
+      addLog(`${data.senderName} から ${data.amount.toLocaleString()}個 のお菓子が届きました！`, 'success', 'gift');
+    } else if (data.type === 'steal_result') {
+      if (data.success) {
+        setCandies(c => c + data.stolen);
+        setTotalCandiesEarned(t => t + data.stolen);
+        playSound('steal');
+        addLog(`オンライン強奪成功！ ${data.targetName} から ${data.stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success', 'thief');
+      } else {
+        playSound('fail');
+        addLog(`強奪失敗… ${data.message ?? ''}`, 'fail', 'bomb');
+      }
+    }
+  };
+
   useEffect(() => {
-    try {
-      const bc = new BroadcastChannel('halloween_candy_heist_p2p');
-      channelRef.current = bc;
+    let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
-      bc.onmessage = (event) => {
-        const data = event.data;
-        if (!data) return;
+    const connect = () => {
+      setConnStatus('connecting');
+      const ws = new WebSocket(getWsUrl());
+      wsRef.current = ws;
 
-        if (data.type === 'PLAYER_PING') {
-          bc.postMessage({
-            type: 'PLAYER_STATE',
-            player: {
-              id: myId,
-              name: myName,
-              avatar: '🎃',
-              candies: Math.floor(candies),
-              level: playerLevel,
-              lastActive: Date.now()
-            }
-          });
-        } else if (data.type === 'PLAYER_STATE') {
-          const p = data.player;
-          if (p && p.id !== myId) {
-            setOnlinePlayers(prev => {
-              const existingIndex = prev.findIndex(item => item.id === p.id);
-              if (existingIndex >= 0) {
-                const copy = [...prev];
-                copy[existingIndex] = { ...p };
-                return copy;
-              } else {
-                return [...prev, { ...p }];
-              }
-            });
-          }
-        } else if (data.type === 'STEAL_ATTEMPT' && data.targetId === myId) {
-          const stolen = Math.floor(candies * 0.2);
-          if (stolen > 0) {
-            setCandies(c => Math.max(0, c - stolen));
-            playSound('fail');
-            addLog(`🚨 警告！ ${data.thiefName} にあなたのお菓子が ${stolen.toLocaleString()}個 盗まれました！`, 'alert');
-            
-            bc.postMessage({
-              type: 'STEAL_RESPONSE',
-              thiefId: data.thiefId,
-              targetName: myName,
-              success: true,
-              stolen
-            });
-          }
-        } else if (data.type === 'STEAL_RESPONSE' && data.thiefId === myId) {
-          if (data.success) {
-            setCandies(c => c + data.stolen);
-            setTotalCandiesEarned(t => t + data.stolen);
-            playSound('steal');
-            addLog(`🦹‍♂️ P2P強奪成功！ ${data.targetName} から ${data.stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
-          }
-        }
+      ws.onopen = () => {
+        setConnStatus('online');
+        ws.send(JSON.stringify({
+          type: 'join',
+          id: myId,
+          name: myName,
+          avatar: 'pumpkin',
+          candies: Math.floor(candiesRef.current),
+          level: levelRef.current
+        }));
       };
-
-      const broadcastPresence = () => {
-        bc.postMessage({
-          type: 'PLAYER_STATE',
-          player: {
-            id: myId,
-            name: myName,
-            avatar: '🎃',
-            candies: Math.floor(candies),
-            level: playerLevel,
-            lastActive: Date.now()
-          }
-        });
+      ws.onmessage = (event) => {
+        try {
+          wsHandlerRef.current(JSON.parse(event.data));
+        } catch (e) {}
       };
-
-      broadcastPresence();
-      bc.postMessage({ type: 'PLAYER_PING' });
-
-      const presenceTimer = setInterval(broadcastPresence, 3000);
-      const cleanupTimer = setInterval(() => {
-        const now = Date.now();
-        setOnlinePlayers(prev => prev.filter(p => now - p.lastActive < 8000));
-      }, 4000);
-
-      return () => {
-        clearInterval(presenceTimer);
-        clearInterval(cleanupTimer);
-        bc.close();
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        setOnlinePlayers([]);
+        if (disposed) return;
+        setConnStatus('offline');
+        retryTimer = setTimeout(connect, 3000);
       };
-    } catch (e) {}
-  }, [myId, myName, candies, playerLevel]);
+    };
+
+    connect();
+
+    // Periodically push my candy count / level to the server
+    const updateTimer = setInterval(() => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'update', candies: Math.floor(candiesRef.current), level: levelRef.current }));
+      }
+    }, 1500);
+
+    return () => {
+      disposed = true;
+      clearTimeout(retryTimer);
+      clearInterval(updateTimer);
+      wsRef.current?.close();
+    };
+  }, [myId, myName]);
 
   // --- AUDIO SYNTHESIZER ---
   const playSound = (type: 'pop' | 'steal' | 'fail' | 'level' | 'buy') => {
@@ -362,16 +389,16 @@ export default function App() {
       if (!ach.unlocked && ach.condition(currentState)) {
         playSound('level');
         setCandies(c => c + ach.reward);
-        addLog(`🏆 実績解除: 「${ach.title}」！ 報酬 +${ach.reward} 🍬`, 'success');
+        addLog(`実績解除: 「${ach.title}」！ 報酬 +${ach.reward} お菓子`, 'success', 'trophy');
         return { ...ach, unlocked: true };
       }
       return ach;
     }));
   }, [totalCandiesEarned, clickCount, heistCount, playerLevel]);
 
-  const addLog = (text: string, type: 'success' | 'fail' | 'info' | 'alert') => {
+  const addLog = (text: string, type: 'success' | 'fail' | 'info' | 'alert', icon?: LogIconName) => {
     const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    setLogs(prev => [{ id: getUniqueId(), time: now, text, type }, ...prev.slice(0, 19)]);
+    setLogs(prev => [{ id: getUniqueId(), time: now, text, type, icon }, ...prev.slice(0, 19)]);
   };
 
   // --- PUMPKIN CLICK & RAIN EFFECT ---
@@ -398,7 +425,7 @@ export default function App() {
     const textId = getUniqueId();
     setFloatingTexts(prev => [
       ...prev.slice(-15),
-      { id: textId, x: clientX || window.innerWidth / 2, y: (clientY || window.innerHeight / 2) - 40, text: `+${earned.toFixed(0)} 🍬`, color: '#ff9933' }
+      { id: textId, x: clientX || window.innerWidth / 2, y: (clientY || window.innerHeight / 2) - 40, text: `+${earned.toFixed(0)}`, color: '#ff9933' }
     ]);
     setTimeout(() => {
       setFloatingTexts(prev => prev.filter(t => t.id !== textId));
@@ -409,7 +436,7 @@ export default function App() {
       x: Math.random() * window.innerWidth,
       speed: Math.random() * 3 + 4,
       size: Math.random() * 16 + 20,
-      emoji: ['🍬', '🍫', '🍭', '⭐', '🎃'][Math.floor(Math.random() * 5)]
+      sprite: RAIN_SPRITES[Math.floor(Math.random() * RAIN_SPRITES.length)]
     }));
     setRainDrops(prev => [...prev.slice(-30), ...newDrops]);
   };
@@ -429,7 +456,37 @@ export default function App() {
       return u;
     }));
 
-    addLog(`✨ アップグレード購入: ${upgrade.name} (Lv.${upgrade.level + 1})`, 'success');
+    addLog(`アップグレード購入: ${upgrade.name} (Lv.${upgrade.level + 1})`, 'success', 'sparkles');
+  };
+
+  // --- SELL UPGRADE (exchange back into candies) ---
+  const sellUpgrade = (upgradeId: string) => {
+    const upgrade = upgrades.find(u => u.id === upgradeId);
+    if (!upgrade || upgrade.level <= 0) return;
+
+    const prevCost = costAtLevel(upgradeId, upgrade.level - 1);
+    const refund = Math.floor(prevCost * SELL_REFUND_RATE);
+
+    setCandies(prev => prev + refund);
+    playSound('pop');
+
+    setUpgrades(prev => prev.map(u => u.id === upgradeId ? { ...u, level: u.level - 1, cost: prevCost } : u));
+
+    addLog(`${upgrade.name} をお菓子 ${refund.toLocaleString()}個 に交換しました (Lv.${upgrade.level - 1})`, 'info', 'candy');
+  };
+
+  // --- GIFT CANDIES TO AN ONLINE FRIEND ---
+  const giftTarget = onlinePlayers.find(p => p.id === giftTargetId) ?? null;
+  const parsedGiftAmount = Math.floor(Number(giftAmount));
+  const isGiftAmountValid = Number.isFinite(parsedGiftAmount) && parsedGiftAmount > 0 && parsedGiftAmount <= Math.floor(candies);
+
+  const sendGift = () => {
+    const ws = wsRef.current;
+    if (!giftTarget || !isGiftAmountValid || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // Push the latest balance first so the server validates against it
+    ws.send(JSON.stringify({ type: 'update', candies: Math.floor(candies), level: playerLevel }));
+    ws.send(JSON.stringify({ type: 'gift', targetId: giftTarget.id, amount: parsedGiftAmount }));
+    setGiftTargetId(null);
   };
 
   // --- LEVEL UP ---
@@ -439,7 +496,7 @@ export default function App() {
     setCandies(prev => prev - levelUpCost);
     setPlayerLevel(prev => prev + 1);
     playSound('level');
-    addLog(`🎉 プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピング効率がアップ！`, 'success');
+    addLog(`プレイヤーレベルが Lv.${playerLevel + 1} に昇格！タッピング効率がアップ！`, 'success', 'party');
   };
 
   // --- STEAL ACTIONS ---
@@ -448,14 +505,10 @@ export default function App() {
     const targetPlayer = onlinePlayers.find(p => p.id === targetId);
     if (!targetPlayer) return;
 
-    if (channelRef.current) {
-      channelRef.current.postMessage({
-        type: 'STEAL_ATTEMPT',
-        thiefId: myId,
-        thiefName: myName,
-        targetId
-      });
-      addLog(`🦹‍♂️ ${targetPlayer.name} の隠れ家に忍び込んでいます...`, 'info');
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'steal_attempt', targetId }));
+      addLog(`${targetPlayer.name} の隠れ家に忍び込んでいます...`, 'info', 'thief');
     }
   };
 
@@ -473,12 +526,12 @@ export default function App() {
       setCandies(c => c + stolen);
       setTotalCandiesEarned(t => t + stolen);
       playSound('steal');
-      addLog(`🦹‍♂️ BOT強奪成功！ ${bot.name} から ${stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success');
+      addLog(`BOT強奪成功！ ${bot.name} から ${stolen.toLocaleString()}個 のお菓子をスリ取った！`, 'success', 'thief');
     } else {
       const penalty = Math.floor(candies * 0.05);
       setCandies(c => Math.max(0, c - penalty));
       playSound('fail');
-      addLog(`💥 BOT強奪失敗！ ${bot.name} に見つかり、お菓子を ${penalty}個 奪い返された…！`, 'fail');
+      addLog(`BOT強奪失敗！ ${bot.name} に見つかり、お菓子を ${penalty}個 奪い返された…！`, 'fail', 'bomb');
     }
   };
 
@@ -487,7 +540,7 @@ export default function App() {
     setCandies(0);
     localStorage.setItem('hw_candies', '0');
     playSound('fail');
-    addLog('🧹 お菓子キャッシュをクリアしました！所持お菓子が0個になりました。', 'alert');
+    addLog('お菓子キャッシュをクリアしました！所持お菓子が0個になりました。', 'alert', 'broom');
     setIsResetModalOpen(false);
   };
 
@@ -509,7 +562,7 @@ export default function App() {
     setFloatingTexts([]);
 
     playSound('fail');
-    addLog('⚠️ 全セーブデータ・キャッシュを完全初期化しました。新しいゲームを開始します！', 'alert');
+    addLog('全セーブデータ・キャッシュを完全初期化しました。新しいゲームを開始します！', 'alert', 'warning');
     setIsResetModalOpen(false);
   };
 
@@ -524,11 +577,10 @@ export default function App() {
           style={{ 
             left: `${drop.x}px`, 
             top: `-40px`, 
-            fontSize: `${drop.size}px`,
             animationDuration: `${drop.speed}s`
           }}
         >
-          {drop.emoji}
+          <Sprite name={drop.sprite} className="" style={{ width: drop.size, height: drop.size }} />
         </div>
       ))}
 
@@ -536,17 +588,18 @@ export default function App() {
       {floatingTexts.map(t => (
         <div 
           key={t.id} 
-          className="fixed pointer-events-none font-black text-xl md:text-2xl drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] z-50 animate-fade-up"
+          className="fixed pointer-events-none font-black text-xl md:text-2xl drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] z-50 animate-fade-up flex items-center gap-1"
           style={{ left: t.x - 30, top: t.y, color: t.color }}
         >
-          {t.text}
+          {t.text} <Sprite name="candy" className="w-6 h-6 md:w-7 md:h-7" />
         </div>
       ))}
 
       {/* NEWS TICKER BANNER (COOKIE CLICKER STYLE) */}
-      <div className="bg-purple-950 border-b border-orange-500/30 py-1.5 px-4 text-center text-xs text-amber-300 font-medium overflow-hidden whitespace-nowrap">
-        <span className="animate-pulse mr-2">📢</span>
-        {SPOOKY_NEWS[newsIndex]}
+      <div className="bg-purple-950 border-b border-orange-500/30 py-1.5 px-4 text-xs text-amber-300 font-medium overflow-hidden whitespace-nowrap flex items-center justify-center gap-2">
+        <LogIcon name="megaphone" className="w-4 h-4 animate-pulse" />
+        <Sprite name={SPOOKY_NEWS[newsIndex].icon} className="w-4 h-4" />
+        <span className="truncate">{SPOOKY_NEWS[newsIndex].text}</span>
       </div>
 
       {/* TOP HEADER */}
@@ -557,8 +610,9 @@ export default function App() {
               <Skull className="w-6 h-6 text-black" />
             </div>
             <div>
-              <h1 className="text-lg md:text-xl font-black bg-gradient-to-r from-orange-400 via-amber-300 to-yellow-400 bg-clip-text text-transparent">
-                🎃 ぬすんでハロウィン！(Cookie Clicker Style)
+              <h1 className="text-lg md:text-xl font-black flex items-center gap-2">
+                <Sprite name="pumpkin" className="w-6 h-6" />
+                <span className="bg-gradient-to-r from-orange-400 via-amber-300 to-yellow-400 bg-clip-text text-transparent">ぬすんでハロウィン！(Cookie Clicker Style)</span>
               </h1>
               <p className="text-xs text-purple-300">{myName} (Lv.{playerLevel})</p>
             </div>
@@ -566,6 +620,14 @@ export default function App() {
 
           {/* TOP ACTION BUTTONS */}
           <div className="flex items-center gap-2">
+            <div
+              className={`p-2 rounded-xl border text-xs font-bold flex items-center gap-1 ${connStatus === 'online' ? 'bg-green-950/50 border-green-500/40 text-green-300' : connStatus === 'connecting' ? 'bg-amber-950/50 border-amber-500/40 text-amber-300' : 'bg-gray-900/60 border-gray-500/40 text-gray-400'}`}
+              title="サーバーとの接続状態"
+            >
+              <Wifi className="w-4 h-4" />
+              <span>{connStatus === 'online' ? 'オンライン' : connStatus === 'connecting' ? '接続中…' : '切断（再接続中）'}</span>
+            </div>
+
             <button 
               onClick={() => setIsResetModalOpen(true)}
               className="p-2 rounded-xl bg-red-950/50 hover:bg-red-900/60 text-red-300 border border-red-500/40 transition-all cursor-pointer flex items-center gap-1 text-xs font-bold shadow-md"
@@ -595,7 +657,7 @@ export default function App() {
           <div className="text-center w-full">
             <h2 className="text-sm uppercase tracking-widest text-orange-400 font-bold mb-1">ジャック・オー・ランタン</h2>
             <div className="text-3xl md:text-4xl font-black text-orange-400 drop-shadow-[0_2px_8px_rgba(255,117,24,0.5)]">
-              {Math.floor(candies).toLocaleString()} <span className="text-xl">🍬</span>
+              <span className="inline-flex items-center gap-2">{Math.floor(candies).toLocaleString()} <Sprite name="candy" className="w-8 h-8" /></span>
             </div>
             <p className="text-xs text-purple-300 mt-1">
               秒間生産 (CPS): <span className="text-amber-300 font-bold">{autoCps.toFixed(1)}</span>
@@ -609,8 +671,8 @@ export default function App() {
             className={`cursor-pointer transition-transform duration-100 select-none relative my-6 group ${isPumpActive ? 'scale-90 rotate-3' : 'hover:scale-105 active:scale-95'}`}
           >
             <div className="absolute inset-0 bg-orange-500/30 rounded-full blur-3xl group-hover:bg-orange-500/50 transition-all" />
-            <div className="relative text-9xl md:text-[10rem] filter drop-shadow-[0_15px_25px_rgba(255,117,24,0.5)] animate-bounce-slow">
-              🎃
+            <div className="relative filter drop-shadow-[0_15px_25px_rgba(255,117,24,0.5)] animate-bounce-slow">
+              <Sprite name="pumpkin" className="w-36 h-36 md:w-44 md:h-44" />
             </div>
           </div>
 
@@ -621,14 +683,14 @@ export default function App() {
               <span className="font-black text-amber-300 text-sm">Lv. {playerLevel}</span>
             </div>
             <div className="text-[11px] text-slate-400">
-              クリック威力: <span className="text-orange-400 font-bold">+{clickPower}</span> 🍬
+              クリック威力: <span className="text-orange-400 font-bold">+{clickPower}</span> <Sprite name="candy" className="w-3.5 h-3.5 align-[-2px]" />
             </div>
             <button 
               onClick={handleLevelUp}
               disabled={candies < levelUpCost}
               className={`w-full py-2.5 px-3 rounded-xl font-bold flex items-center justify-center gap-2 text-xs transition-all cursor-pointer ${candies >= levelUpCost ? 'bg-gradient-to-r from-orange-500 to-amber-500 text-black hover:opacity-90 shadow-lg shadow-orange-500/30' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
             >
-              <Sparkles className="w-3.5 h-3.5" /> 昇格する ({levelUpCost.toLocaleString()} 🍬)
+              <Sparkles className="w-3.5 h-3.5" /> 昇格する ({levelUpCost.toLocaleString()} <Sprite name="candy" className="w-3.5 h-3.5" />)
             </button>
           </div>
 
@@ -683,11 +745,11 @@ export default function App() {
                 <div 
                   key={upgrade.id} 
                   onClick={() => canAfford && buyUpgrade(upgrade.id)}
-                  className={`p-3 rounded-2xl border transition-all flex items-center justify-between gap-3 ${canAfford ? 'bg-black/60 border-orange-500/40 hover:border-orange-400 cursor-pointer shadow-md' : 'bg-black/30 border-purple-500/20 opacity-60 cursor-not-allowed'}`}
+                  className={`p-3 rounded-2xl border transition-all flex items-center justify-between gap-3 ${canAfford ? 'bg-black/60 border-orange-500/40 hover:border-orange-400 cursor-pointer shadow-md' : 'bg-black/30 border-purple-500/20 cursor-not-allowed'}`}
                 >
-                  <div className="flex items-center gap-3">
-                    <div className="text-3xl p-2 bg-purple-950 rounded-xl border border-purple-500/30">
-                      {upgrade.type === 'click' ? '🪄' : upgrade.type === 'auto' ? '👻' : upgrade.type === 'stealth' ? '🗡️' : '🔥'}
+                  <div className={`flex items-center gap-3 ${canAfford ? '' : 'opacity-60'}`}>
+                    <div className="p-2 bg-purple-950 rounded-xl border border-purple-500/30">
+                      <Sprite name={UPGRADE_SPRITES[upgrade.type]} className="w-8 h-8" />
                     </div>
                     <div>
                       <div className="flex items-center gap-2">
@@ -695,18 +757,30 @@ export default function App() {
                         <span className="text-[10px] bg-purple-900 px-1.5 py-0.5 rounded text-purple-200">Lv.{upgrade.level}</span>
                       </div>
                       <p className="text-[10px] text-slate-400">{upgrade.description}</p>
-                      <div className="text-xs font-bold text-amber-300 mt-1">
-                        {Math.floor(upgrade.cost).toLocaleString()} 🍬
+                      <div className="text-xs font-bold text-amber-300 mt-1 flex items-center gap-1">
+                        {Math.floor(upgrade.cost).toLocaleString()} <Sprite name="candy" className="w-3.5 h-3.5" />
                       </div>
                     </div>
                   </div>
 
-                  <button 
-                    disabled={!canAfford}
-                    className={`py-1.5 px-3 rounded-xl font-bold text-xs whitespace-nowrap ${canAfford ? 'bg-orange-500 text-black hover:bg-orange-400' : 'bg-gray-800 text-gray-500'}`}
-                  >
-                    購入
-                  </button>
+                  <div className="flex flex-col gap-1.5 shrink-0">
+                    <button 
+                      disabled={!canAfford}
+                      className={`py-1.5 px-3 rounded-xl font-bold text-xs whitespace-nowrap ${canAfford ? 'bg-orange-500 text-black hover:bg-orange-400' : 'bg-gray-800 text-gray-500'}`}
+                    >
+                      購入
+                    </button>
+                    {upgrade.level > 0 && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); sellUpgrade(upgrade.id); }}
+                        className="py-1 px-2 rounded-xl font-bold text-[10px] whitespace-nowrap bg-purple-800 text-purple-100 hover:bg-purple-700 border border-purple-400/40 flex items-center justify-center gap-1 cursor-pointer"
+                        title="1レベル分をお菓子に交換します"
+                      >
+                        <Repeat className="w-3 h-3" />
+                        交換 +{Math.floor(costAtLevel(upgrade.id, upgrade.level - 1) * SELL_REFUND_RATE).toLocaleString()}
+                      </button>
+                    )}
+                  </div>
                 </div>
               );
             })}
@@ -719,7 +793,7 @@ export default function App() {
             <h2 className="text-base font-black text-orange-400 flex items-center gap-2">
               <Users className="w-5 h-5" /> 強奪ターゲット (ハイスト)
             </h2>
-            <span className="text-xs text-green-400 font-bold">P2P連動</span>
+            <span className="text-xs text-green-400 font-bold">オンライン連動</span>
           </div>
 
           <div className="flex-1 overflow-y-auto space-y-4 pr-1">
@@ -731,25 +805,33 @@ export default function App() {
               </h3>
               {onlinePlayers.length === 0 ? (
                 <div className="bg-black/30 border border-purple-500/20 p-3 rounded-xl text-center text-xs text-slate-400 mb-3">
-                  別タブで開くとリアルタイム同期します
+                  {connStatus === 'online' ? '他の端末から同じURLを開くとリアルタイム同期します' : 'サーバーに接続できていません'}
                 </div>
               ) : (
                 <div className="space-y-2 mb-3">
                   {onlinePlayers.map(player => (
                     <div key={player.id} className="bg-black/50 border border-green-500/30 rounded-xl p-2.5 flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
-                        <span className="text-2xl">{player.avatar}</span>
+                        <Sprite name={player.avatar} className="w-8 h-8" />
                         <div>
                           <div className="font-bold text-xs text-green-300">{player.name}</div>
-                          <div className="text-[10px] text-amber-400">{player.candies.toLocaleString()} 🍬</div>
+                          <div className="text-[10px] text-amber-400 flex items-center gap-1">{player.candies.toLocaleString()} <Sprite name="candy" className="w-3 h-3" /></div>
                         </div>
                       </div>
-                      <button 
-                        onClick={() => attemptOnlineSteal(player.id)}
-                        className="py-1 px-2.5 rounded-lg font-bold bg-green-600 hover:bg-green-500 text-black text-[11px]"
-                      >
-                        盗む
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => { setGiftTargetId(player.id); setGiftAmount(String(Math.min(100, Math.floor(candies)))); }}
+                          className="py-1 px-2 rounded-lg font-bold bg-pink-500 hover:bg-pink-400 text-black text-[11px] flex items-center gap-1 cursor-pointer"
+                        >
+                          <Gift className="w-3 h-3" /> 贈る
+                        </button>
+                        <button 
+                          onClick={() => attemptOnlineSteal(player.id)}
+                          className="py-1 px-2.5 rounded-lg font-bold bg-green-600 hover:bg-green-500 text-black text-[11px] cursor-pointer"
+                        >
+                          盗む
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -765,10 +847,10 @@ export default function App() {
                 {offlineBots.map(bot => (
                   <div key={bot.id} className="bg-black/50 border border-purple-500/30 rounded-xl p-2.5 flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <span className="text-2xl">{bot.avatar}</span>
+                      <Sprite name={bot.avatar} className="w-8 h-8" />
                       <div>
                         <div className="font-bold text-xs text-orange-300">{bot.name}</div>
-                        <div className="text-[10px] text-amber-400">{bot.candies.toLocaleString()} 🍬</div>
+                        <div className="text-[10px] text-amber-400 flex items-center gap-1">{bot.candies.toLocaleString()} <Sprite name="candy" className="w-3 h-3" /></div>
                       </div>
                     </div>
                     <button 
@@ -795,14 +877,75 @@ export default function App() {
           </h2>
           <div className="bg-black/50 rounded-xl p-3 border border-purple-500/20 overflow-y-auto max-h-[120px] space-y-1.5 text-xs">
             {logs.map(log => (
-              <div key={log.id} className={`p-1.5 rounded-lg border ${log.type === 'success' ? 'bg-green-950/40 border-green-500/30 text-green-200' : log.type === 'fail' ? 'bg-red-950/40 border-red-500/30 text-red-200' : log.type === 'alert' ? 'bg-orange-950/40 border-orange-500/30 text-orange-200' : 'bg-purple-950/40 border-purple-500/30 text-purple-200'}`}>
-                <span className="text-[10px] text-slate-400 mr-2">[{log.time}]</span>
+              <div key={log.id} className={`p-1.5 rounded-lg border flex items-center gap-1.5 ${log.type === 'success' ? 'bg-green-950/40 border-green-500/30 text-green-200' : log.type === 'fail' ? 'bg-red-950/40 border-red-500/30 text-red-200' : log.type === 'alert' ? 'bg-orange-950/40 border-orange-500/30 text-orange-200' : 'bg-purple-950/40 border-purple-500/30 text-purple-200'}`}>
+                <span className="text-[10px] text-slate-400 mr-0.5 shrink-0">[{log.time}]</span>
+                {log.icon && <LogIcon name={log.icon} className="w-3.5 h-3.5" />}
                 <span>{log.text}</span>
               </div>
             ))}
           </div>
         </div>
       </div>
+
+      {/* GIFT MODAL */}
+      {giftTargetId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
+          <div className="bg-gradient-to-b from-purple-950 to-slate-950 border border-pink-500/40 rounded-3xl p-6 max-w-md w-full shadow-2xl relative text-slate-100">
+            <button 
+              onClick={() => setGiftTargetId(null)}
+              className="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-white hover:bg-white/15 transition-all cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-12 h-12 rounded-2xl bg-pink-600/20 border border-pink-500/40 flex items-center justify-center text-pink-400">
+                <Gift className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-lg font-black text-orange-400">お菓子を贈る</h3>
+                <p className="text-xs text-purple-300">
+                  {giftTarget ? `${giftTarget.name} へプレゼント` : '相手がオフラインになりました'}
+                </p>
+              </div>
+            </div>
+
+            <label className="block text-xs text-slate-300 mb-1.5">
+              贈る個数（所持: {Math.floor(candies).toLocaleString()}個）
+            </label>
+            <div className="flex items-center gap-2 mb-3">
+              <input
+                type="number"
+                min={1}
+                max={Math.floor(candies)}
+                value={giftAmount}
+                onChange={(e) => setGiftAmount(e.target.value)}
+                className="flex-1 bg-black/50 border border-purple-500/40 rounded-xl px-3 py-2 text-sm text-amber-200 focus:outline-none focus:border-pink-400"
+              />
+              <Sprite name="candy" className="w-6 h-6" />
+            </div>
+            <div className="grid grid-cols-4 gap-2 mb-5">
+              {[0.1, 0.25, 0.5, 1].map(rate => (
+                <button
+                  key={rate}
+                  onClick={() => setGiftAmount(String(Math.floor(candies * rate)))}
+                  className="py-1.5 rounded-lg bg-purple-900/70 hover:bg-purple-800 border border-purple-500/30 text-[11px] font-bold text-purple-200 cursor-pointer"
+                >
+                  {rate === 1 ? '全部' : `${rate * 100}%`}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={sendGift}
+              disabled={!giftTarget || !isGiftAmountValid}
+              className={`w-full py-2.5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${giftTarget && isGiftAmountValid ? 'bg-gradient-to-r from-pink-500 to-orange-400 text-black hover:opacity-90 cursor-pointer' : 'bg-gray-800 text-gray-500 cursor-not-allowed'}`}
+            >
+              <Gift className="w-4 h-4" /> 贈呈する
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* CLEAR / RESET MODAL */}
       {isResetModalOpen && (
@@ -834,7 +977,7 @@ export default function App() {
                 onClick={handleClearCandiesOnly}
                 className="w-full p-3.5 rounded-2xl bg-orange-950/60 hover:bg-orange-900/70 border border-orange-500/40 text-left transition-all cursor-pointer group flex items-start gap-3"
               >
-                <span className="text-2xl">🍬</span>
+                <Sprite name="candy" className="w-7 h-7" />
                 <div>
                   <div className="text-sm font-bold text-orange-300 group-hover:text-orange-200">
                     お菓子のみクリア (残高を0にする)
@@ -849,7 +992,7 @@ export default function App() {
                 onClick={handleFullReset}
                 className="w-full p-3.5 rounded-2xl bg-red-950/60 hover:bg-red-900/70 border border-red-500/50 text-left transition-all cursor-pointer group flex items-start gap-3"
               >
-                <span className="text-2xl">💀</span>
+                <Sprite name="skull" className="w-7 h-7" />
                 <div>
                   <div className="text-sm font-bold text-red-300 group-hover:text-red-200">
                     全データ・キャッシュを完全初期化
