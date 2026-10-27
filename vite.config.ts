@@ -12,6 +12,8 @@ export default defineConfig(() => {
       },
     },
     server: {
+      // Public domain the dev server is accessed through
+      allowedHosts: ['nusuharo.hina17.com'],
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',

@@ -16,7 +16,13 @@ async function startServer() {
   app.use(express.json());
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  // Route upgrades manually so the game socket (/ws) and Vite's HMR socket can share one port
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    if (req.url?.split('?')[0] === '/ws') {
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    }
+  });
 
   interface OnlinePlayer {
     id: string;
@@ -171,7 +177,8 @@ async function startServer() {
 
   if (!isProduction) {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      // Serve HMR over the same HTTP server so it works behind the public domain
+      server: { middlewareMode: true, hmr: process.env.DISABLE_HMR === 'true' ? false : { server } },
       appType: 'spa',
     });
     app.use(vite.middlewares);
